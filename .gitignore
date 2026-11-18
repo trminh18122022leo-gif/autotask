@@ -1,0 +1,16 @@
+node_modules/
+.private/
+reports/
+artifacts/
+.env
+*.log
+__pycache__/
+*.pyc
+dist/
+terminal/windows-terminal-scheme.json
+terminal/windows-terminal-profile-settings.json
+release/
+scratch/
+*.zip
+.env.*
+*.pem

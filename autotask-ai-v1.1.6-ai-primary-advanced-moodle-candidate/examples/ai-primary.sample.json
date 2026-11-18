@@ -1,0 +1,5 @@
+{
+  "answerSourceMode": "AI_PRIMARY",
+  "answerFilePaths": ["C:/Users/Admin/Documents/optional-form-data.xlsx"],
+  "explanation": "AI solves all supported quiz questions; saved form-data paths are ignored unless FORM_FILE is explicitly selected. This sample is illustrative, not a complete browser-task config."
+}

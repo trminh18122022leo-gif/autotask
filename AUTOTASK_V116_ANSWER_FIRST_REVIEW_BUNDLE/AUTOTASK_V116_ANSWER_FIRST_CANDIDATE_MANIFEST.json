@@ -1,0 +1,24 @@
+{
+  "sourceZip": "autotask-ai-v1.1.6-lms-failclosed-clean.zip",
+  "sourceSha256": "7f420f3bf0a4ee16b625a9efa9d0e688c9942993a7ba1ffc985abe611151638f",
+  "outputZip": "autotask-ai-v1.1.6-answer-first-candidate.zip",
+  "outputSha256": "6995c6ecb1c41f5a5b670abbcf2f15cecf8e95e4d8dbb00a9cc5f107f3adfd79",
+  "sizeBytes": 370608,
+  "entryCount": 139,
+  "modifiedFiles": [
+    "src/ai.ts",
+    "src/config.ts",
+    "src/fill.ts",
+    "src/main.ts",
+    "src/setup.ts",
+    "src/types.ts"
+  ],
+  "addedFiles": [
+    "examples/ANSWER_FILE_WORKFLOW.md",
+    "examples/answer-bank.sample.csv",
+    "examples/answer-bank.sample.json",
+    "src/answer-bank.ts",
+    "tests/answer-bank.test.ts"
+  ],
+  "notes": "Offline candidate; does not claim live LMS acceptance or complete Windows typecheck"
+}

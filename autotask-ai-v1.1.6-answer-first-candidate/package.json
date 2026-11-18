@@ -1,0 +1,44 @@
+{
+  "name": "autotask-ai-workstation",
+  "version": "1.1.6",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/launcher.ts",
+    "ui": "tsx src/launcher.ts",
+    "setup": "tsx src/setup.ts",
+    "browser": "tsx src/main.ts",
+    "desktop": "tsx src/desktop.ts",
+    "models": "tsx src/ui/model-center-cli.ts",
+    "model-center": "tsx src/ui/model-center-cli.ts",
+    "accounts": "tsx src/ui/accounts-cli.ts",
+    "theme": "tsx src/ui/appearance-cli.ts",
+    "appearance": "tsx src/ui/appearance-cli.ts",
+    "queue": "tsx src/ui/task-queue-cli.ts",
+    "radar": "tsx src/ui/deadline-radar-cli.ts",
+    "discover": "tsx src/discover-cli.ts",
+    "notes": "tsx src/notes-cli.ts",
+    "history": "tsx src/history-cli.ts",
+    "doctor": "tsx src/doctor.ts",
+    "preview": "tsx src/ui/preview.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "selfcheck": "tsx --test tests/*.test.ts",
+    "capture": "tsx src/capture-cli.ts",
+    "check:offline": "node scripts/offline-build.cjs && node --test dist/tests/*.test.js && python -m unittest discover -s tests -p \"*test.py\"",
+    "smoke:local": "tsc -p tsconfig.json && node tests/local-browser-smoke.mjs",
+    "package:release": "powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1",
+    "check:full": "npm run typecheck && npm test && npm run smoke:local && python -m unittest discover -s tests -p \"*test.py\""
+  },
+  "dependencies": {
+    "playwright": "^1.56.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

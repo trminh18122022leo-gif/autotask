@@ -1,0 +1,22 @@
+{
+  "name": "AutoTask Cyberpunk",
+  "background": "#090817",
+  "foreground": "#f2eaff",
+  "cursorColor": "#00f5ff",
+  "black": "#090817",
+  "red": "#ff4870",
+  "green": "#95ff6e",
+  "yellow": "#fff17a",
+  "blue": "#6ea8ff",
+  "purple": "#ff4fd8",
+  "cyan": "#00f5ff",
+  "white": "#f2eaff",
+  "brightBlack": "#563c83",
+  "brightRed": "#ff4870",
+  "brightGreen": "#95ff6e",
+  "brightYellow": "#fff17a",
+  "brightBlue": "#6ea8ff",
+  "brightPurple": "#b266ff",
+  "brightCyan": "#4effc3",
+  "brightWhite": "#ffffff"
+}

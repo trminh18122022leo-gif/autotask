@@ -1,0 +1,2059 @@
+--- a/src/ai.ts
++++ b/src/ai.ts
+@@ -13,6 +13,7 @@
+  return ((raw as {answers: unknown[]}).answers).map((v):Answer => {
+    if (!v || typeof v !== 'object') throw new Error('Answer không phải object');
+    const a=v as Answer;
++   if (a.localFilePath !== undefined) throw new Error("Model is not permitted to choose a local upload file path");
+    const q=choices.get(a.id);
+    if (q && (q.kind==='unsupported' || q.humanOnly)) throw new Error(`Question ${a.id} needs the learner (${q.unsupportedReason||q.humanOnly}); automatic answers are not accepted`);
+     if (!q || seen.has(a.id)) throw new Error(`Câu hỏi không khớp hoặc trùng: ${a.id}`);
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -150,6 +150,12 @@
+   if (!Array.isArray(data.tasks) || (!data.tasks.length && !data.autoDiscover)) {
+     throw new Error('Chưa có tasks và chưa bật autoDiscover');
+   }
++  for (const filePaths of [data.answerFilePaths, ...data.tasks.map(t=>t.answerFilePaths)]) {
++    if (filePaths === undefined) continue;
++    if (!Array.isArray(filePaths) || filePaths.length > 25 || filePaths.some(f=>typeof f!=='string'||f.trim().length===0||f.length>1024||/^https?:\/\//i.test(f))) {
++      throw new Error('answerFilePaths must contain up to 25 explicit local paths');
++    }
++  }
+   if (!Number.isInteger(data.parallelTabs) || data.parallelTabs < 1 || data.parallelTabs > 3) {
+     throw new Error('parallelTabs phải từ 1 đến 3');
+   }
+@@ -160,6 +166,11 @@
+   const originOpts = originTrustFromConfig(data);
+ 
+   for (const task of data.tasks) {
++    for (const selector of [task.challengeInputSelector,task.challengeVerifySelector]) {
++      if (selector !== undefined && (typeof selector !== 'string' || selector.length<1 || selector.length>200)) {
++        throw new Error('Challenge selector must be a short explicit CSS selector');
++      }
++    }
+     if (task.note && (typeof task.note !== 'string' || task.note.length > 6000)) {
+       throw new Error('Task note exceeds 6000 characters');
+     }
+--- a/src/fill.ts
++++ b/src/fill.ts
+@@ -1,5 +1,5 @@
+ import type { Page, Frame } from 'playwright';
+-import { mkdir, writeFile } from 'node:fs/promises';
++import { mkdir, writeFile, lstat } from 'node:fs/promises';
+ import {createDocument,safeFormat} from './documents.js';
+ import { resolve, basename, extname } from 'node:path';
+ import type { Question, Answer } from './types.js';
+@@ -57,7 +57,14 @@
+      throw new Error('Không xác minh được combobox sau khi chọn');
+   }
+  } else if(question.kind==='file') {
+-  const p=await outputFile(answer);
++  let p:string;
++  if (answer.localFilePath) {
++   p=resolve(answer.localFilePath);
++   const st=await lstat(p);
++   if (!st.isFile() || st.isSymbolicLink() || st.size>30*1024*1024) throw new Error('Local upload file is invalid, a symlink, or larger than 30 MB');
++   if (!new Set(['.txt','.md','.csv','.pdf','.docx','.xlsx','.png','.jpg','.jpeg','.pptx']).has(extname(p).toLowerCase())) throw new Error('Local upload extension not allowed');
++   if (p.split(/[\\/]/).some(part=>part==='.private'||part==='.ssh')) throw new Error('Sensitive private file cannot be uploaded automatically');
++  } else p=await outputFile(answer);
+   await control.first().setInputFiles(p);
+   const count=await control.first().evaluate((el:Element)=>(el as HTMLInputElement).files?.length||0);
+   if(count!==1) throw new Error('File chưa xuất hiện trong trường upload');
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -1,820 +1,894 @@
+-import { chromium, type BrowserContext, type Page } from 'playwright';
+-const contextBlockHandlers = new WeakMap<BrowserContext, ((route: any) => Promise<void>) | null>();
+-const contextActiveReadOnlyTasks = new WeakMap<BrowserContext, number>();
+-import { createInterface, type Interface as ReadlineInterface } from 'node:readline/promises';
+-import { stdin, stdout } from 'node:process';
+-import { existsSync } from 'node:fs';
+-import { resolve } from 'node:path';
+-import { fileURLToPath } from 'node:url';
+-import { listAccounts, accountContext, loginForContext, forgetSession } from './accounts.js';
+-import { discoverActivities, toTask } from './discovery.js';
+-import { loadTheme } from './ui/themes.js';
+-import { hasUnvisitedPages, readyForReview } from './workflow-guards.js';
+-import { loadConfig, ensureAllowed, isApprovedSsoOrigin, originTrustFromConfig } from './config.js';
+-import { browserSetupInteractive } from './setup.js';
+-import { scanQuestions, scanUnsupported } from './scanner.js';
+-import { readSurfaces, readableFrames, locateNext, revealStart, revealContinue, hasQuestions } from './interaction.js';
+-import { classifyActivityScope, inspectQuizLaunchSurface, evaluateQuizStartPolicy, evaluateAttemptExecutionGate, extractQuizActivityIdentity } from './quiz-start-policy.js';
+-import { resolveEffectiveOperationMode, isStateMutatingActionUrl, isMutatingHttpMethod } from './operation-mode.js';
+-import { detectPlatform, isLoginChallenge } from './platforms.js';
+-import { observeAccess, mostRestrictive, watchUntilAccessible } from './access-gates.js';
+-import { loadNotes, notesFor, type NoteVault } from './ai-notes.js';
+-import { observeScore } from './observations.js';
+-import { solveQuestions } from './ai.js';
+-import { fillAnswer } from './fill.js';
+-import { scanDeadlines } from './calendar.js';
+-import { printSummary, saveReport } from './report.js';
+-import {
+-  resilientGoto,
+-  checkDuplicateRisk,
+-  saveCheckpoint,
+-  loadCheckpoint,
+-  clearCheckpoint
+-} from './task-manager.js';
+-import { ResumeCoordinator } from './browser/resume-coordinator.js';
+-import { executeVerifiedNavigation, isAuthRequired } from './browser/verified-navigation.js';
+-import { redactSecrets } from './security/redact.js';
+-import type { TaskCheckpoint } from './task-manager.js';
+-import type { AppConfig, Deadline, Task, TaskResult } from './types.js';
+-import { header, section, entry, info, success, warn, fail, close, renderBreadcrumb, renderErrorCard } from './ui/tokyo.js';
+-
+-let cliInstance: ReadlineInterface | undefined;
+-function getCli(): ReadlineInterface {
+-  if (!cliInstance) cliInstance = createInterface({ input: stdin, output: stdout });
+-  return cliInstance;
+-}
+-let context:BrowserContext|undefined;
+-let results:TaskResult[]=[];
+-let deadlines:Deadline[]=[];
+-let noteVault:NoteVault={global:'',byHost:{},byTask:{}};
+-
+-export async function executeTask(
+-  browserContext: BrowserContext,
+-  task: Task,
+-  config: AppConfig,
+-  activeNoteVault: NoteVault = { global: '', byHost: {}, byTask: {} },
+-  deadlinesCollector: Deadline[] = []
+-): Promise<TaskResult> {
+- const result:TaskResult={id:task.id,url:task.url,title:task.title||task.id,status:'ERROR',startedAt:new Date().toISOString(),questionsFound:0,questionsFilled:0,warnings:[],scoreObserved:null};
+- const page=await browserContext.newPage();
+- result.page=page;
+-  const effectiveMode = resolveEffectiveOperationMode(config, task);
+-  if (effectiveMode !== 'READ_ONLY') {
+-    const activeRO = contextActiveReadOnlyTasks.get(browserContext) || 0;
+-    if (activeRO === 0) {
+-      const prevHandler = contextBlockHandlers.get(browserContext);
+-      if (prevHandler) {
+-        await browserContext.unroute('**/*', prevHandler).catch(() => {});
+-        contextBlockHandlers.delete(browserContext);
+-      }
+-    }
+-  } else {
+-    const activeRO = (contextActiveReadOnlyTasks.get(browserContext) || 0) + 1;
+-    contextActiveReadOnlyTasks.set(browserContext, activeRO);
+-  }
+-  let contextBlockHandler: ((route: any) => Promise<void>) | null = null;
+-  let popupListener: ((popup: any) => void) | null = null;
+-  try {
+-   const originOpts = originTrustFromConfig(config);
+-   ensureAllowed(task.url, config.allowedHosts, originOpts);
+-   // Pilot-Gate Phase 5: refuse action/mutation endpoints BEFORE any network request is issued (all modes).
+-   if (isStateMutatingActionUrl(task.url)) {
+-    result.status = 'NEEDS_REVIEW';
+-    result.warnings.push(`${effectiveMode === 'READ_ONLY' ? '[READ_ONLY] ' : ''}Chặn điều hướng tới URL có thể thay đổi trạng thái (tạo lượt làm bài/lưu nháp/nộp/đăng xuất/ghi danh): ${redactSecrets(task.url)}; không gửi request nào`);
+-    return result;
+-   }
+-   if (effectiveMode === 'READ_ONLY') {
+-      result.readOnlyBlockedRequests = [];
+-      contextBlockHandler = async (route: any) => {
+-        const req = route.request();
+-        const method = req.method().toUpperCase();
+-        const reqUrl = req.url();
+-        if (isMutatingHttpMethod(method) || isStateMutatingActionUrl(reqUrl)) {
+-          result.readOnlyBlockedRequests!.push(method + ' ' + redactSecrets(reqUrl));
+-          warn('[READ_ONLY_BLOCK] Bat chan yeu cau ghi: ' + method + ' ' + redactSecrets(reqUrl));
+-          return route.abort('blockedbyclient');
+-        }
+-        if (req.isNavigationRequest()) {
+-          try {
+-            const response = await route.fetch({ maxRedirects: 0 });
+-            const status = response.status();
+-            if (status >= 300 && status < 400) {
+-              const loc = response.headers()['location'];
+-              if (loc) {
+-                const absLoc = new URL(loc, reqUrl).toString();
+-                if (isStateMutatingActionUrl(absLoc)) {
+-                  result.readOnlyBlockedRequests!.push('REDIRECT ' + absLoc);
+-                  warn('[READ_ONLY_BLOCK] Bat chan chuyen huong toi URL hanh vi: ' + redactSecrets(absLoc));
+-                  return route.abort('blockedbyclient');
+-                }
+-              }
+-            }
+-            return route.fulfill({ response });
+-          } catch {
+-            return route.abort('blockedbyclient');
+-          }
+-        }
+-        return route.continue();
+-      };
+-      contextBlockHandlers.set(browserContext, contextBlockHandler);
+-      await browserContext.route('**/*', contextBlockHandler);
+-      await page.route('**/*', contextBlockHandler);
+-      popupListener = (popup: any) => {
+-        if (contextBlockHandler) {
+-          popup.route('**/*', contextBlockHandler).catch(() => {});
+-        }
+-      };
+-      browserContext.on('page', popupListener);
+-      await page.addInitScript(() => {
+-        try {
+-          Object.defineProperty(navigator, 'serviceWorker', {
+-            get: () => undefined,
+-            configurable: false
+-          });
+-        } catch {}
+-      }).catch(() => {});
+-      await page.evaluate(() => {
+-        if ('serviceWorker' in navigator && navigator.serviceWorker.getRegistrations) {
+-          navigator.serviceWorker.getRegistrations().then(regs => {
+-            for (const r of regs) r.unregister();
+-          }).catch(() => {});
+-        }
+-      }).catch(() => {});
+-    }
+-   const dup=await checkDuplicateRisk(task.id,task.url);
+-  if(dup.isDuplicateRisk && !task.allowResubmit && !config.forceResubmit){
+-   warn(`  [CHẶN TRÙNG LẶP] ${dup.message}`);
+-   result.status='NEEDS_REVIEW';
+-   result.warnings.push(`ĐÃ CHẶN: ${dup.message}. Cần task.allowResubmit=true để thực hiện lại.`);
+-   return result;
+-  }
+-  const existingCheckpoint = await loadCheckpoint(task.id);
+-  const recordedAnswers: Record<string, any> = {};
+-  const answersByStep: Record<number, Record<string, any>> = {};
+-  if (existingCheckpoint?.answersRecorded) {
+-    Object.assign(recordedAnswers, existingCheckpoint.answersRecorded);
+-  }
+-  if (existingCheckpoint?.answersByStep) {
+-    Object.assign(answersByStep, existingCheckpoint.answersByStep);
+-  }
+-  let startingPageIndex = 0;
+-  let policyCleared = false;
+-  if (existingCheckpoint) {
+-    info(`  [Checkpoint] Phát hiện checkpoint cho ${task.id} (Bước: ${existingCheckpoint.stepsCompleted}/${existingCheckpoint.totalSteps || '?'})`);
+-  }
+-   try {
+-    await resilientGoto(page, task.url);
+-   } catch (gotoErr) {
+-    if (result.readOnlyBlockedRequests?.length) {
+-     result.status = 'NEEDS_REVIEW';
+-     result.warnings.push(`[READ_ONLY] Điều hướng bị chặn vì dẫn tới request thay đổi trạng thái: ${result.readOnlyBlockedRequests.join(', ')}`);
+-     return result;
+-    }
+-    throw gotoErr;
+-   }
+-  try {
+-    ensureAllowed(page.url(), config.allowedHosts, originOpts);
+-  } catch (redirectErr) {
+-    const redirectBody = await page.evaluate(() => (document.body?.innerText || '').slice(0, 12000)).catch(() => '');
+-    if (isApprovedSsoOrigin(page.url(), config) && ((await isAuthRequired(page)) || isLoginChallenge(redirectBody))) {
+-      result.status = 'WAITING_FOR_AUTH';
+-      result.warnings.push(`Trang chuyển hướng tới cổng xác thực SSO được phê duyệt (${new URL(page.url()).origin}); vui lòng đăng nhập thủ công`);
+-      return result;
+-    }
+-    result.status = 'NEEDS_REVIEW';
+-    result.warnings.push(
+-      `Chặn chuyển hướng tới origin ngoài danh sách cho phép (${page.url()}): ${redirectErr instanceof Error ? redirectErr.message : String(redirectErr)}`
+-    );
+-    return result;
+-  }
+-  result.title = (await page.title().catch(() => '')) || task.title || task.id;
+-  const existingGrade = await observeScore(page);
+-  if (existingGrade) result.scoreObserved = existingGrade.text;
+-  const detectedPlatform = await detectPlatform(page, config.allowedHosts, config.moodleHosts);
+-  info(`  Platform detected: ${detectedPlatform} / ${task.id}`);
+-  const currentDeadlines = await scanDeadlines(page, config.deadlineOffset || '+07:00');
+-  if (currentDeadlines[0]) result.deadline = currentDeadlines[0].dueAt;
+-  deadlinesCollector.push(...currentDeadlines);
+-
+-  if (await isAuthRequired(page)) {
+-    result.status = 'WAITING_FOR_AUTH';
+-    result.warnings.push('Trang yêu cầu đăng nhập / xác thực tài khoản trước khi thực hiện tác vụ');
+-    return result;
+-  }
+-  const initialBody = await page.evaluate(() => (document.body?.innerText || '').slice(0, 12000)).catch(() => '');
+-  if (isLoginChallenge(initialBody)) {
+-    result.status = 'WAITING_FOR_AUTH';
+-    result.warnings.push('Phát hiện yêu cầu xác thực MFA / CAPTCHA / danh tính; người dùng cần thực hiện trực tiếp');
+-    return result;
+-  }
+-
+-  if (effectiveMode === 'READ_ONLY') {
+-    const roGates = await observeAccess(page);
+-    const roWaiting = mostRestrictive(roGates);
+-    if (roWaiting) {
+-      result.accessGate = { kind: roWaiting.kind, reason: roWaiting.reason, remainingSeconds: roWaiting.remainingSeconds, recheckAfter: roWaiting.recheckAfter };
+-    }
+-    for (const frame of readableFrames(page, config.allowedHosts, originOpts)) {
+-      result.questionsFound += (await scanQuestions(frame)).length;
+-    }
+-    // Give background scripts a short window to attempt writes so an impure page is never reported as purely read.
+-    await page.waitForTimeout(400);
+-    result.status = 'NEEDS_REVIEW';
+-    result.warnings.push('[READ_ONLY] Chế độ chỉ đọc: chỉ quan sát metadata/hạn nộp/điểm số, không mở lượt làm bài và không điền biểu mẫu');
+-    return result;
+-  }
+-
+-  const headingContext = await page
+-    .evaluate(() => Array.from(document.querySelectorAll('h1, h2, .page-header-headings')).map(e => (e.textContent || '').trim()).join(' '))
+-    .catch(() => '');
+-  const liveHeaderScope = classifyActivityScope(`${task.title || ''} ${result.title} ${headingContext}`);
+-  if (effectiveMode === 'ASSESSMENT_RESTRICTED' || liveHeaderScope.scope === 'ASSESSMENT_RESTRICTED') {
+-    result.status = 'NEEDS_REVIEW';
+-    result.warnings.push(
+-      `[ASSESSMENT_RESTRICTED] Đã chặn tự động thao tác trên bài kiểm tra/thi tính điểm (${liveHeaderScope.evidence})`
+-    );
+-    return result;
+-  }
+-
+-  if (existingCheckpoint) {
+-    // If task.url is an overview/launch page (e.g. Moodle /mod/quiz/view.php) with no questions directly visible,
+-    // navigate to the saved attempt step URL (same allowed origin) or continue the existing attempt without starting a new one.
+-    if (!await hasQuestions(page, config.allowedHosts, originOpts) && !mostRestrictive(await observeAccess(page))) {
+-      if (existingCheckpoint.currentStepUrl && existingCheckpoint.currentStepUrl !== page.url()) {
+-        try {
+-          const stepUrl = ensureAllowed(existingCheckpoint.currentStepUrl, config.allowedHosts, originOpts);
+-          const taskOrigin = ensureAllowed(task.url, config.allowedHosts, originOpts).origin.toLowerCase();
+-          if (stepUrl.origin.toLowerCase() === taskOrigin) {
+-            await resilientGoto(page, existingCheckpoint.currentStepUrl);
+-          }
+-        } catch {}
+-        try {
+-          ensureAllowed(page.url(), config.allowedHosts, originOpts);
+-        } catch (stepRedirectErr) {
+-          if (isApprovedSsoOrigin(page.url(), config) && (await isAuthRequired(page))) {
+-            result.status = 'WAITING_FOR_AUTH';
+-            result.warnings.push(`Phiên đăng nhập hết hạn khi khôi phục checkpoint; chuyển tới SSO (${new URL(page.url()).origin})`);
+-            return result;
+-          }
+-          result.status = 'NEEDS_REVIEW';
+-          result.warnings.push(
+-            `Chuyển hướng ngoài origin cho phép khi khôi phục checkpoint: ${stepRedirectErr instanceof Error ? stepRedirectErr.message : String(stepRedirectErr)}`
+-          );
+-          return result;
+-        }
+-        if (await isAuthRequired(page)) {
+-          result.status = 'WAITING_FOR_AUTH';
+-          result.warnings.push('Phiên làm việc đã hết hạn khi khôi phục checkpoint; vui lòng đăng nhập lại');
+-          return result;
+-        }
+-      }
+-      if (!await hasQuestions(page, config.allowedHosts, originOpts)) {
+-        const resumeLaunch = await inspectQuizLaunchSurface(page, config.allowedHosts, task.title, originOpts);
+-        if (resumeLaunch.scope === 'ASSESSMENT_RESTRICTED') {
+-          result.status = 'NEEDS_REVIEW';
+-          result.warnings.push(`[ASSESSMENT_RESTRICTED] Dừng khôi phục trên bài kiểm tra tính điểm: ${resumeLaunch.scopeEvidence}`);
+-          return result;
+-        }
+-        if (resumeLaunch.hasContinueAttemptControl) {
+-          if (effectiveMode !== 'PRACTICE_ASSISTED' || resumeLaunch.scope !== 'PRACTICE_VERIFIED') {
+-            result.status = 'NEEDS_REVIEW';
+-            result.warnings.push(
+-              `Dừng khôi phục: tiếp tục lượt đang mở cần mode=\"PRACTICE_ASSISTED\" tường minh và phạm vi tự luyện đã xác minh (mode hiệu lực: ${effectiveMode ?? 'chưa đặt'}; phạm vi: ${resumeLaunch.scope} — ${resumeLaunch.scopeEvidence}); không tạo lượt mới thay thế`
+-            );
+-            return result;
+-          }
+-          await revealContinue(page, config.allowedHosts, originOpts);
+-          ensureAllowed(page.url(), config.allowedHosts, originOpts);
+-          policyCleared = true;
+-        } else if (resumeLaunch.hasNewAttemptControl || resumeLaunch.hasStartAttemptForm || resumeLaunch.exhaustedAttempts) {
+-          result.status = 'NEEDS_REVIEW';
+-          result.warnings.push(
+-            'Checkpoint phát hiện lượt làm bài trước không còn mở trên server (chỉ thấy nút tạo lượt mới hoặc đã hết lượt); dừng NEEDS_REVIEW để chống tạo lượt làm bài trùng lặp'
+-          );
+-          return result;
+-        }
+-      }
+-    }
+-    const resumeEval = await ResumeCoordinator.evaluateState(page, existingCheckpoint, config);
+-    if (resumeEval.state === 'WAITING_FOR_AUTH') {
+-      warn(`  [ResumeCoordinator] ${resumeEval.reason}`);
+-      result.status = 'WAITING_FOR_AUTH';
+-      result.warnings.push(resumeEval.reason);
+-      return result;
+-    }
+-    if (resumeEval.state === 'WAITING_FOR_ACCESS') {
+-      warn(`  [ResumeCoordinator] ${resumeEval.reason}`);
+-      result.status = 'WAITING_FOR_ACCESS';
+-      if (resumeEval.accessGate) {
+-        result.accessGate = { kind: resumeEval.accessGate.kind, reason: resumeEval.accessGate.reason, remainingSeconds: resumeEval.accessGate.remainingSeconds, recheckAfter: resumeEval.accessGate.recheckAfter };
+-      }
+-      result.warnings.push(resumeEval.reason);
+-      return result;
+-    }
+-    if (resumeEval.state === 'NEEDS_REVIEW' || resumeEval.state === 'COMPLETED_VERIFIED') {
+-      info(`  [ResumeCoordinator] ${resumeEval.reason}`);
+-      result.status = 'NEEDS_REVIEW';
+-      result.warnings.push(`Checkpoint: ${resumeEval.reason}`);
+-      return result;
+-    }
+-    if (resumeEval.state === 'STATE_MISMATCH') {
+-      warn(`  [ResumeCoordinator] Không thể khôi phục: ${resumeEval.reason}`);
+-      result.warnings.push(`Checkpoint: ${resumeEval.reason}`);
+-      result.status = 'NEEDS_REVIEW';
+-      return result;
+-    }
+-    if (resumeEval.state === 'NAVIGATION_REQUIRED') {
+-      info(`  [ResumeCoordinator] Tự động chuyển tiếp từ bước ${resumeEval.currentStep} đến bước ${resumeEval.targetStep}`);
+-      const advanced = await ResumeCoordinator.advanceToStep(page, existingCheckpoint, resumeEval.targetStep, config, task.nextButton);
+-      if (!advanced) {
+-        warn(`  [ResumeCoordinator] Chuyển tiếp bước không thành công`);
+-        result.status = 'NEEDS_REVIEW';
+-        result.warnings.push(`Không thể chuyển tiếp an toàn đến bước ${resumeEval.targetStep}`);
+-        return result;
+-      }
+-      startingPageIndex = resumeEval.targetStep - 1;
+-    } else if (resumeEval.state === 'RESUME_READY') {
+-      info(`  [ResumeCoordinator] ${resumeEval.reason}`);
+-      startingPageIndex = Math.max(0, resumeEval.currentStep - 1);
+-    }
+-    if (startingPageIndex > 0) {
+-      result.questionsFound = existingCheckpoint.questionsFound || 0;
+-      result.questionsFilled = existingCheckpoint.questionsFilled || 0;
+-    }
+-  } else {
+-    if (!await hasQuestions(page, config.allowedHosts, originOpts) &&
+-        /no more attempts are allowed|không còn lượt làm bài|bạn đã hoàn thành bài kiểm tra|your response has been recorded|câu trả lời của bạn đã được ghi nhận/i.test(initialBody)) {
+-      result.status = 'NEEDS_REVIEW';
+-      result.warnings.push('Hoạt động đã hoàn thành hoặc không còn lượt làm bài mới; chỉ ghi nhận kết quả, không tự động thực thi lại');
+-      return result;
+-    }
+-  }
+-  const visited = new Set<string>();
+-  let complete = true;
+-  let gateCleared = false;
+-  let scopeVerifiedRecord: TaskCheckpoint['scopeVerified'] = existingCheckpoint?.scopeVerified;
+-  let anySupported = false;
+-  let hasUnsupportedOrHumanOnly = false;
+-  let serverSavedSteps = existingCheckpoint?.serverSavedSteps ?? startingPageIndex;
+-  for (let pageIndex = startingPageIndex; pageIndex < (task.maxPages || 1); pageIndex++) {
+-    try {
+-      ensureAllowed(page.url(), config.allowedHosts, originOpts);
+-    } catch (loopOriginErr) {
+-      if (isApprovedSsoOrigin(page.url(), config) && (await isAuthRequired(page))) {
+-        result.status = 'WAITING_FOR_AUTH';
+-        result.warnings.push(`Chuyển hướng tới SSO được phê duyệt (${new URL(page.url()).origin})`);
+-      } else {
+-        result.status = 'NEEDS_REVIEW';
+-        result.warnings.push(
+-          `Origin không được phê duyệt (${page.url()}): ${loopOriginErr instanceof Error ? loopOriginErr.message : String(loopOriginErr)}`
+-        );
+-      }
+-      complete = false;
+-      break;
+-    }
+-    if (await isAuthRequired(page)) {
+-      result.status = 'WAITING_FOR_AUTH';
+-      result.warnings.push('Trang yêu cầu đăng nhập / xác thực tài khoản');
+-      complete = false;
+-      break;
+-    }
+-    const gates = await observeAccess(page);
+-    for (const g of gates.filter(g => !g.blocked)) result.warnings.push(`${g.kind}: ${g.reason}`);
+-    let waiting = mostRestrictive(gates);
+-    if (waiting && (config.accessWatchMinutes || 0) > 0) {
+-      info(`${task.id}: ${waiting.kind} — monitoring availability, no gate bypass or synthetic reading`);
+-      const observed = await watchUntilAccessible(() => observeAccess(page), config.accessWatchMinutes || 0);
+-      waiting = observed.ready ? undefined : observed.gate;
+-    }
+-    if (waiting) {
+-      result.status = 'WAITING_FOR_ACCESS';
+-      result.accessGate = { kind: waiting.kind, reason: waiting.reason, remainingSeconds: waiting.remainingSeconds, recheckAfter: waiting.recheckAfter };
+-      result.warnings.push(waiting.reason);
+-      await saveCheckpoint({
+-        taskId: task.id,
+-        url: task.url,
+-        currentStepUrl: page.url(),
+-        status: 'WAITING_FOR_ACCESS',
+-        stepsCompleted: pageIndex,
+-        totalSteps: task.maxPages || 1,
+-        questionsFound: result.questionsFound,
+-        questionsFilled: result.questionsFilled,
+-        answersRecorded: recordedAnswers,
+-        answersByStep: answersByStep,
+-        ...(scopeVerifiedRecord ? { scopeVerified: scopeVerifiedRecord } : {}),
+-        lastUpdated: new Date().toISOString()
+-      });
+-      break;
+-    }
+-    if (!existingCheckpoint && pageIndex === 0 && !await hasQuestions(page, config.allowedHosts, originOpts)) {
+-      const launchInspection = await inspectQuizLaunchSurface(page, config.allowedHosts, task.title, originOpts);
+-      const startDecision = await evaluateQuizStartPolicy({
+-        page,
+-        task,
+-        config,
+-        platform: detectedPlatform,
+-        inspection: launchInspection
+-      });
+-      if (startDecision.action === 'HALT_NEEDS_REVIEW') {
+-        result.status = 'NEEDS_REVIEW';
+-        result.warnings.push(startDecision.reason);
+-        complete = false;
+-        break;
+-      }
+-      let launched = false;
+-      if (startDecision.action === 'CONTINUE_EXISTING_ATTEMPT') {
+-        launched = await revealContinue(page, config.allowedHosts, originOpts);
+-      } else if (startDecision.action === 'START_NEW_ATTEMPT') {
+-        launched = await revealStart(page, config.allowedHosts, { ...originOpts, allowNewAttempt: true });
+-      }
+-      if (launched) {
+-        policyCleared = true;
+-        try {
+-          ensureAllowed(page.url(), config.allowedHosts, originOpts);
+-        } catch (afterLaunchErr) {
+-          if (isApprovedSsoOrigin(page.url(), config) && (await isAuthRequired(page))) {
+-            result.status = 'WAITING_FOR_AUTH';
+-            result.warnings.push(`Yêu cầu xác thực SSO sau khi mở hoạt động (${new URL(page.url()).origin})`);
+-          } else {
+-            result.status = 'NEEDS_REVIEW';
+-            result.warnings.push(
+-              `Origin không hợp lệ sau khi mở hoạt động: ${afterLaunchErr instanceof Error ? afterLaunchErr.message : String(afterLaunchErr)}`
+-            );
+-          }
+-          complete = false;
+-          break;
+-        }
+-        if (await isAuthRequired(page)) {
+-          result.status = 'WAITING_FOR_AUTH';
+-          result.warnings.push('Trang yêu cầu đăng nhập sau khi mở hoạt động');
+-          complete = false;
+-          break;
+-        }
+-        const gateAfterStart = mostRestrictive(await observeAccess(page));
+-        if (gateAfterStart) {
+-          result.status = 'WAITING_FOR_ACCESS';
+-          result.accessGate = { kind: gateAfterStart.kind, reason: gateAfterStart.reason, remainingSeconds: gateAfterStart.remainingSeconds, recheckAfter: gateAfterStart.recheckAfter };
+-          result.warnings.push(gateAfterStart.reason);
+-          break;
+-        }
+-      }
+-    }
+-    // Unified pre-solve gate: direct attempt URLs, checkpoint resume, Task Queue retries and page transitions all revalidate here.
+-    if (await hasQuestions(page, config.allowedHosts, originOpts)) {
+-      const gate = await evaluateAttemptExecutionGate({
+-        page,
+-        task,
+-        config,
+-        platform: detectedPlatform,
+-        checkpoint: existingCheckpoint,
+-        policyCleared
+-      });
+-      if (!gate.allowed) {
+-        result.status = 'NEEDS_REVIEW';
+-        result.warnings.push(`[ATTEMPT_GATE:${gate.code}] ${gate.reason}`);
+-        complete = false;
+-        break;
+-      }
+-      gateCleared = true;
+-      if (detectedPlatform === 'moodle' && effectiveMode === 'PRACTICE_ASSISTED') {
+-        const idInfo = extractQuizActivityIdentity(page.url());
+-        scopeVerifiedRecord = {
+-          scope: 'PRACTICE_VERIFIED',
+-          mode: 'PRACTICE_ASSISTED',
+-          origin: new URL(page.url()).origin,
+-          verifiedAt: new Date().toISOString(),
+-          taskId: task.id,
+-          cmid: idInfo.cmid || (scopeVerifiedRecord as any)?.cmid,
+-          quizId: idInfo.quizId || (scopeVerifiedRecord as any)?.quizId,
+-          attemptId: idInfo.attemptId || (scopeVerifiedRecord as any)?.attemptId,
+-          source: 'ATTEMPT_PAGE_VERIFIED'
+-        };
+-      }
+-    }
+-    const surfaces = await readSurfaces(page, config.allowedHosts, originOpts);
+-    let pageQuestions = 0;
+-    for (const { frame, url } of surfaces) {
+-      const framePlatform = await detectPlatform(frame, config.allowedHosts, config.moodleHosts);
+-      const unsupported = await scanUnsupported(frame);
+-      if (unsupported.length) {
+-        hasUnsupportedOrHumanOnly = true;
+-        complete = false;
+-        result.warnings.push(...unsupported.map(x => `${framePlatform}: ${x}`));
+-      }
+-      const questions = await scanQuestions(frame);
+-      if (!questions.length) continue;
+-      pageQuestions += questions.length;
+-      const actionable = questions.filter(q => q.kind !== 'unsupported' && !q.humanOnly);
+-      if (actionable.length > 0) anySupported = true;
+-      const fingerprint = url + '|' + questions.map(q => q.prompt + ':' + q.options.map(o => o.text).join('|')).join('||');
+-      if (visited.has(fingerprint)) {
+-        complete = false; result.warnings.push('Câu hỏi/trang bị lặp, cần kiểm tra thủ công'); break;
+-      }
+-      visited.add(fingerprint);
+-      result.questionsFound += questions.length;
+-      const answers = actionable.length
+-        ? await solveQuestions(page, actionable, config, frame, notesFor(activeNoteVault, task.id, task.url, task.note))
+-        : [];
+-      const byId = new Map(answers.map(a => [a.id, a]));
+-      const stepAnswers: Record<string, any> = {};
+-      for (const q of questions) {
+-        if (q.kind === 'unsupported') {
+-          hasUnsupportedOrHumanOnly = true;
+-          complete = false;
+-          result.warnings.push(`UNSUPPORTED [${q.id}${q.sourceType ? `/${q.sourceType}` : ''}]: ${q.unsupportedReason || 'Loại câu hỏi chưa hỗ trợ; cần xem xét thủ công'}`);
+-          continue;
+-        }
+-        if (q.humanOnly) {
+-          hasUnsupportedOrHumanOnly = true;
+-          complete = false;
+-          result.warnings.push(`HUMAN_ONLY [${q.id}]: ${q.humanOnly}`);
+-          continue;
+-        }
+-        const answer = byId.get(q.id);
+-        if (!answer) { complete = false; result.warnings.push(`Chưa có câu trả lời: ${url}/${q.id}`); continue; }
+-        if (answer.confidence !== undefined && answer.confidence < 0.6) {
+-          result.warnings.push(`LOW_CONFIDENCE [${q.id}]: Model tự báo confidence=${answer.confidence.toFixed(2)} (<0.60); cần người học kiểm tra kỹ đáp án`);
+-        }
+-        try {
+-          await fillAnswer(frame, q, answer);
+-          result.questionsFilled++;
+-          const recorded = { selected: answer.selected, text: answer.text, fileName: answer.fileName };
+-          stepAnswers[q.id] = recorded;
+-          recordedAnswers[q.id] = recorded;
+-        }
+-        catch (e) { complete = false; result.warnings.push(`Không điền được ${q.id}: ${e instanceof Error ? e.message : String(e)}`); }
+-      }
+-      answersByStep[pageIndex + 1] = { ...(answersByStep[pageIndex + 1] || {}), ...stepAnswers };
+-    }
+-    if (!pageQuestions) { result.warnings.push('Không tìm thấy trường hỗ trợ trên trang hoặc iframe đã cấp quyền'); complete = false; break; }
+-    const preNavStepUrl = page.url();
+-    await saveCheckpoint({
+-      taskId: task.id,
+-      url: task.url,
+-      currentStepUrl: preNavStepUrl,
+-      status: 'RUNNING',
+-      stepsCompleted: pageIndex + 1,
+-      domFilledSteps: pageIndex + 1,
+-      serverSavedSteps,
+-      totalSteps: task.maxPages || 1,
+-      questionsFound: result.questionsFound,
+-      questionsFilled: result.questionsFilled,
+-      answersRecorded: recordedAnswers,
+-      answersByStep: answersByStep,
+-      ...(scopeVerifiedRecord ? { scopeVerified: scopeVerifiedRecord } : {}),
+-      lastUpdated: new Date().toISOString()
+-    });
+-    if (!complete) break;
+-    if (pageIndex === ((task.maxPages || 1) - 1)) {
+-      const next = await locateNext(page, config.allowedHosts, task.nextButton, originOpts);
+-      // Avoid falsely reporting READY when more pages exist beyond the configured limit.
+-      if (hasUnvisitedPages(pageIndex, task.maxPages || 1, Boolean(next))) {
+-        complete = false;
+-        result.warnings.push(`Reached maxPages=${task.maxPages || 1} but the site still has a Next page`);
+-      }
+-      break;
+-    }
+-
+-    // Unified Observe -> Act -> Verify page navigation (Phase 4: AUD-114-05)
+-    const navResult = await executeVerifiedNavigation(page, config, task.nextButton, pageIndex + 1);
+-    if (!navResult.success) {
+-      if (navResult.state === 'SUBMIT_GUARD') {
+-        // Submit page reached safely; current step remains DOM-filled only until explicit user submit
+-        break;
+-      }
+-      if (navResult.state === 'AUTH_REQUIRED') {
+-        result.status = 'WAITING_FOR_AUTH';
+-      } else if (navResult.state === 'ACCESS_RESTRICTED') {
+-        result.status = 'WAITING_FOR_ACCESS';
+-      } else if (navResult.state === 'HOST_MISMATCH' || navResult.state === 'NEEDS_REVIEW') {
+-        result.status = 'NEEDS_REVIEW';
+-      } else if (navResult.state === 'ERROR') {
+-        // Server / HTTP error during page transition: roll back stepsCompleted to confirmed serverSavedSteps
+-        // so unpersisted DOM edits are never falsely recorded as server-saved.
+-        await saveCheckpoint({
+-          taskId: task.id,
+-          url: task.url,
+-          currentStepUrl: preNavStepUrl,
+-          status: 'PARTIAL',
+-          stepsCompleted: serverSavedSteps,
+-          domFilledSteps: pageIndex + 1,
+-          serverSavedSteps,
+-          lastSaveError: navResult.reason,
+-          totalSteps: task.maxPages || 1,
+-          questionsFound: result.questionsFound,
+-          questionsFilled: result.questionsFilled,
+-          answersRecorded: recordedAnswers,
+-          answersByStep: answersByStep,
+-          ...(scopeVerifiedRecord ? { scopeVerified: scopeVerifiedRecord } : {}),
+-          lastUpdated: new Date().toISOString()
+-        });
+-      }
+-      complete = false;
+-      result.warnings.push(`Dừng chuyển trang ở bước ${pageIndex + 1}: ${navResult.reason}`);
+-      break;
+-    }
+-    serverSavedSteps = pageIndex + 1;
+-    await saveCheckpoint({
+-      taskId: task.id,
+-      url: task.url,
+-      currentStepUrl: preNavStepUrl,
+-      status: 'RUNNING',
+-      stepsCompleted: pageIndex + 1,
+-      domFilledSteps: pageIndex + 1,
+-      serverSavedSteps,
+-      totalSteps: task.maxPages || 1,
+-      questionsFound: result.questionsFound,
+-      questionsFilled: result.questionsFilled,
+-      answersRecorded: recordedAnswers,
+-      answersByStep: answersByStep,
+-      ...(scopeVerifiedRecord ? { scopeVerified: scopeVerifiedRecord } : {}),
+-      lastUpdated: new Date().toISOString()
+-    });
+-  }
+-  if(!anySupported)complete=false;
+-  if(result.status!=='WAITING_FOR_ACCESS' && result.status!=='WAITING_FOR_AUTH' && result.status!=='NEEDS_REVIEW'){
+-   if(readyForReview({supported:anySupported,complete,filled:result.questionsFilled,found:result.questionsFound,waiting:false})){
+-    result.status='READY_FOR_REVIEW';
+-   }else if(hasUnsupportedOrHumanOnly && result.questionsFilled===0){
+-    result.status='NEEDS_REVIEW';
+-   }else{
+-    result.status='PARTIAL';
+-   }
+-  }
+-  if(result.questionsFilled!==result.questionsFound)result.warnings.push('Còn câu chưa điền; không được tự nộp');
+- }catch(e){result.warnings.push(redactSecrets(e instanceof Error?e.message:String(e)));result.status='ERROR';}
+- finally {
+-    const effMode = resolveEffectiveOperationMode(config, task);
+-    if (effMode === 'READ_ONLY') {
+-      const remainingRO = Math.max(0, (contextActiveReadOnlyTasks.get(browserContext) || 1) - 1);
+-      contextActiveReadOnlyTasks.set(browserContext, remainingRO);
+-    }
+-    if (popupListener) {
+-      browserContext.off('page', popupListener);
+-    }
+-    if (result.readOnlyBlockedRequests?.length) {
+-      result.warnings.push(`[READ_ONLY_WRITE_BLOCKED] Đã chặn ${result.readOnlyBlockedRequests.length} request có thể thay đổi trạng thái: ${result.readOnlyBlockedRequests.slice(0, 5).join(", ")}`);
+-      if (result.status === 'READY_FOR_REVIEW' || result.status === 'PARTIAL') result.status = 'NEEDS_REVIEW';
+-    }
+-    result.finishedAt = new Date().toISOString();
+-  }
+- return result;
+-}
+-
+-export async function createReadOnlyContext(browser: any, options: any = {}): Promise<BrowserContext> {
+-  return browser.newContext({
+-    serviceWorkers: 'block',
+-    acceptDownloads: true,
+-    viewport: { width: 1280, height: 900 },
+-    ...options
+-  });
+-}
+-
+-export async function prepareTask(task:Task,config:AppConfig):Promise<TaskResult> {
+-  const effectiveMode = resolveEffectiveOperationMode(config, task);
+-  if (effectiveMode === 'READ_ONLY' && config.operationMode !== 'READ_ONLY' && context) {
+-    const browser = context.browser();
+-    if (browser) {
+-      const roContext = await browser.newContext({
+-        serviceWorkers: 'block',
+-        acceptDownloads: true,
+-        viewport: { width: 1280, height: 900 }
+-      });
+-      try {
+-        return await executeTask(roContext, task, config, noteVault, deadlines);
+-      } finally {
+-        await roContext.close().catch(() => {});
+-      }
+-    }
+-  }
+-  return executeTask(context!, task, config, noteVault, deadlines);
+-}
+-async function parallelMap<T,U>(list:T[],parallel:number,fn:(item:T)=>Promise<U>):Promise<U[]> {
+- const out=new Array<U>(list.length);let cursor=0;
+- await Promise.all(Array.from({length:Math.min(parallel,list.length)},async()=>{
+-  while(cursor<list.length){const i=cursor++;out[i]=await fn(list[i]);}
+- }));return out;
+-}
+-async function confirmOne(task:Task,r:TaskResult,config:AppConfig):Promise<void>{
+- if(r.status!=='READY_FOR_REVIEW'){
+-  warn(`Bỏ qua nộp ${task.id}: trạng thái ${r.status}`);return;
+- }
+- info(`${task.id}: đã điền ${r.questionsFilled}/${r.questionsFound}; chưa nộp.`);
+- const confirm=(await getCli().question(`Gõ chính xác SUBMIT ${task.id} để nộp, hoặc Enter để GIỮ NGUYÊN: `)).trim();
+- if(confirm!==`SUBMIT ${task.id}`){r.status='NOT_SUBMITTED';return;}
+- try {
+-  const page=r.page!;
+-  ensureAllowed(page.url(),config.allowedHosts,originTrustFromConfig(config));
+-  const submitName=task.submitButton||/^(Submit|Submit all and finish|Submit quiz|Submit assignment|Turn in|Nộp bài|Gửi bài|Hoàn thành và nộp)$/i;
+-  const submit=page.getByRole('button',{name:submitName,exact:typeof submitName==='string'});
+-  if(await submit.count()!==1){r.status='NOT_SUBMITTED';r.warnings.push('Submit button not uniquely identified; leave to manual review');return;}
+-  await submit.click();
+-  r.status='UNCONFIRMED';
+-  if(task.successText){
+-   await page.getByText(task.successText,{exact:false}).first().waitFor({timeout:12000});
+-   r.status='SUBMITTED';
+-   await clearCheckpoint(task.id);
+-  }
+-  if(task.scoreSelector){const score=page.locator(task.scoreSelector);if(await score.count()===1)r.scoreObserved=(await score.innerText()).trim().slice(0,150);}
+-  else {const grade=await observeScore(page);if(grade)r.scoreObserved=grade.text;}
+- }catch(e){r.status='UNCONFIRMED';r.warnings.push(`Nộp/chờ xác nhận: ${e instanceof Error?e.message:String(e)}`);}
+-}
+-async function main():Promise<void>{
+-  await loadTheme();
+-  const configPath = process.argv[2] || '.private/browser-task.json';
+-  let config: AppConfig;
+-  if (!existsSync(configPath)) {
+-    header('BROWSER AGENT');
+-    renderBreadcrumb(['COMMAND DECK', 'BROWSER AGENT', 'SETUP REQUIRED']);
+-    renderErrorCard(
+-      'Chưa tìm thấy cấu hình tác vụ (.private/browser-task.json)',
+-      'Browser Agent cần danh sách website được phép và tác vụ để thực hiện.',
+-      'Khởi chạy Setup Wizard tương tác để tạo cấu hình'
+-    );
+-    const configured = await browserSetupInteractive();
+-    if (!configured || !existsSync(configPath)) {
+-      warn('Chưa hoàn tất cấu hình Browser Agent. Quay lại menu.');
+-      return;
+-    }
+-  }
+-  config = await loadConfig(configPath);
+- noteVault=await loadNotes();
+- await loadTheme();
+- header('BROWSER AGENT');
+- section('Session overview');
+- entry('TASKS',String(config.tasks.length),'cyan');
+- entry('PARALLEL TABS',String(config.parallelTabs),'aqua');
+- entry('SUBMISSION','Approval per task','orange');
+- entry('AI NOTES',noteVault.global||Object.keys(noteVault.byHost).length||Object.keys(noteVault.byTask).length?'Configured':'None','cyan');
+- info('AI only on explicitly authorized tasks. CAPTCHA/MFA remains manual.');
+- const cli = getCli();
+- const accepted=(await cli.question('Gõ ACCEPT để bắt đầu, cho phép đọc nội dung bài và (nếu bật AI cloud) gửi nội dung cho nhà cung cấp: ')).trim();
+- if(accepted!=='ACCEPT'){warn('Đã hủy.');return;}
+- if(!config.confirmAttemptStart){
+-  config.confirmAttemptStart=async({taskId,title,buttonLabel,url})=>{
+-   info(`[XÁC NHẬN MỞ LƯỢT TỰ LUYỆN MỚI] ${taskId} — "${title}" (${url}) yêu cầu bấm "${buttonLabel}".`);
+-   const ans=(await cli.question(`Gõ chính xác START ${taskId} để xác nhận mở lượt tự luyện mới, hoặc Enter để GIỮ NGUYÊN (NEEDS_REVIEW): `)).trim();
+-   return ans===`START ${taskId}`;
+-  };
+- }
+- const mainOriginOpts=originTrustFromConfig(config);
+- const accountDb=await listAccounts();
+- const savedAccount=config.accountId?accountDb[config.accountId]:null;
+- if(config.accountId && !savedAccount)throw new Error(`Unknown account profile: ${config.accountId}. Run npm run accounts first.`);
+- const swOption = config.operationMode === 'READ_ONLY' ? 'block' : 'allow';
+-
+- context=savedAccount?await accountContext(config.accountId!,savedAccount,{serviceWorkers:swOption}):await chromium.launchPersistentContext(resolve('.private','chromium-profile'),{headless:false,viewport:{width:1280,height:900},acceptDownloads:true,serviceWorkers:swOption});
+- if(savedAccount)await loginForContext(context,config.accountId!,savedAccount,q=>cli.question(q));
+- for(const url of config.authUrls||[]){
+-  const page=await context.newPage();await page.goto(url,{waitUntil:'domcontentloaded'});
+-  info(`Đăng nhập thủ công tại ${url} (bao gồm MFA nếu có).`);
+-  await cli.question('Sau khi đăng nhập xong và quay về trang cho phép, nhấn Enter... ');
+-  await page.close();
+- }
+- for(const url of config.deadlinePages||[]){
+-  const page=await context.newPage();
+-  try{await page.goto(url,{waitUntil:'domcontentloaded'});ensureAllowed(page.url(),config.allowedHosts,mainOriginOpts);
+-      deadlines.push(...await scanDeadlines(page,config.deadlineOffset||'+07:00'));
+-  }catch(e){warn(`Không thể quét lịch ${url}: ${e instanceof Error?e.message:String(e)}`);}
+-  finally{await page.close();}
+- }
+- let tasks=config.tasks;
+- if(config.autoDiscover){
+-  section('Automatic LMS discovery');
+-  const seeds=config.discoveryStartUrls?.length?config.discoveryStartUrls:(config.deadlinePages?.length?config.deadlinePages:tasks.map(t=>t.url));
+-  const found=await discoverActivities(context,seeds,config.allowedHosts,config.maxDiscoveryPages||25,config.deadlineOffset,mainOriginOpts);
+-  deadlines.push(...found.deadlines);
+-  const activities=found.activities;
+-  for(let i=0;i<activities.length;i++)entry(`${i+1}. ${activities[i].kind}`,activities[i].title.slice(0,65));
+-  for(const w of found.warnings)warn(w);
+-  if(activities.length){
+-   const pick=(await cli.question(`Select ALL, comma-separated indices (1..${activities.length}), or Enter to keep configured tasks: `)).trim();
+-   if(pick.toUpperCase()==='ALL') tasks=[...tasks,...activities.map(toTask)];
+-   else if(pick){
+-    const ids=pick.split(',').map(x=>Number(x.trim())-1).filter(x=>Number.isInteger(x)&&x>=0&&x<activities.length);
+-    tasks=[...tasks,...[...new Set(ids)].map(i=>toTask(activities[i]))];
+-   }
+-  }
+- }
+- tasks=[...new Map(tasks.map(t=>[t.url,t])).values()];
+- if(!tasks.length){warn('No tasks selected. Calendar scan/report only.');}
+- results=await parallelMap(tasks,config.parallelTabs,t=>prepareTask(t,config));
+- printSummary(results,deadlines);
+- for(let i=0;i<results.length;i++)await confirmOne(tasks[i],results[i],config);
+- printSummary(results,deadlines);
+- success('JSON report: '+await saveReport(results,deadlines));
+- const action=(await cli.question('Session: Enter=KEEP saved login, LOGOUT=clear cookies, FORGET=remove local browser session: ')).trim().toUpperCase();
+- if(action==='LOGOUT') {await context.clearCookies();info('Cookies cleared; website local storage may still retain session data. Use FORGET to remove it.');}
+- else if(action==='FORGET'&&config.accountId){await context.close();context=undefined;await forgetSession(config.accountId);success('Saved browser profile deleted; account credentials retained in OS vault.');}
+- else if(action==='FORGET'){await context.close();context=undefined;await (await import('node:fs/promises')).rm(resolve('.private','chromium-profile'),{recursive:true,force:true});}
+- else info('Saved browser session retained for next run.');
+-}
+-const isDirectRun = Boolean(
+-  process.argv[1] &&
+-  resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase()
+-);
+-if (isDirectRun) {
+-  main().catch(e=>{fail('Browser Agent: '+redactSecrets(String(e)));process.exitCode=1;}).finally(async()=>{
+-   await context?.close();close('SESSION CLOSED');cliInstance?.close();
+-  });
+-}
++import { chromium, type BrowserContext, type Page } from 'playwright';
++const contextBlockHandlers = new WeakMap<BrowserContext, ((route: any) => Promise<void>) | null>();
++const contextActiveReadOnlyTasks = new WeakMap<BrowserContext, number>();
++import { createInterface, type Interface as ReadlineInterface } from 'node:readline/promises';
++import { stdin, stdout } from 'node:process';
++import { existsSync } from 'node:fs';
++import { resolve } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { listAccounts, accountContext, loginForContext, forgetSession } from './accounts.js';
++import { discoverActivities, toTask } from './discovery.js';
++import { loadTheme } from './ui/themes.js';
++import { hasUnvisitedPages, readyForReview } from './workflow-guards.js';
++import { loadConfig, ensureAllowed, isApprovedSsoOrigin, originTrustFromConfig } from './config.js';
++import { browserSetupInteractive } from './setup.js';
++import { scanQuestions, scanUnsupported } from './scanner.js';
++import { readSurfaces, readableFrames, locateNext, revealStart, revealContinue, hasQuestions } from './interaction.js';
++import { classifyActivityScope, inspectQuizLaunchSurface, evaluateQuizStartPolicy, evaluateAttemptExecutionGate, extractQuizActivityIdentity } from './quiz-start-policy.js';
++import { resolveEffectiveOperationMode, isStateMutatingActionUrl, isMutatingHttpMethod } from './operation-mode.js';
++import { detectPlatform, isLoginChallenge } from './platforms.js';
++import { observeAccess, mostRestrictive, watchUntilAccessible } from './access-gates.js';
++import { loadNotes, notesFor, type NoteVault } from './ai-notes.js';
++import { observeScore } from './observations.js';
++import { solveQuestions } from './ai.js';
++import { loadAnswerBanks, splitBankAndAi } from './answer-bank.js';
++import { fillAnswer } from './fill.js';
++import { scanDeadlines } from './calendar.js';
++import { printSummary, saveReport } from './report.js';
++import {
++  resilientGoto,
++  checkDuplicateRisk,
++  saveCheckpoint,
++  loadCheckpoint,
++  clearCheckpoint
++} from './task-manager.js';
++import { ResumeCoordinator } from './browser/resume-coordinator.js';
++import { executeVerifiedNavigation, isAuthRequired } from './browser/verified-navigation.js';
++import { redactSecrets } from './security/redact.js';
++import type { TaskCheckpoint } from './task-manager.js';
++import type { AppConfig, Deadline, Task, TaskResult } from './types.js';
++import { header, section, entry, info, success, warn, fail, close, renderBreadcrumb, renderErrorCard } from './ui/tokyo.js';
++
++let cliInstance: ReadlineInterface | undefined;
++function getCli(): ReadlineInterface {
++  if (!cliInstance) cliInstance = createInterface({ input: stdin, output: stdout });
++  return cliInstance;
++}
++let context:BrowserContext|undefined;
++let results:TaskResult[]=[];
++let deadlines:Deadline[]=[];
++let noteVault:NoteVault={global:'',byHost:{},byTask:{}};
++
++/** Pauses on CAPTCHA/OTP. Never tries to read/solve challenges using AI or evade login.
++ * User may solve in the visible browser (Enter) or type the manually obtained code
++ * when the task has an explicitly configured, unique challenge input selector.
++ */
++let authPromptQueue:Promise<unknown>=Promise.resolve();
++async function resumeAfterManualChallenge(page:Page,task:Task,config:AppConfig):Promise<boolean>{
++ if(!config.interactiveAuthRecovery)return false;
++ const work=async():Promise<boolean>=>{
++ info(`[CHỜ XÁC THỰC] ${task.id}: CAPTCHA/OTP/SSO xuất hiện tại trang ${redactSecrets(page.url())}`);
++ info('Bạn lấy mã CAPTCHA từ ảnh/ô thử thách ngay trên trang Chromium đang mở; OTP lấy từ ứng dụng/kênh xác thực của chính bạn. Không gửi mã cho AI.');
++ const label=task.challengeInputSelector?'Nhập mã nhìn thấy (hoặc Enter nếu đã tự xác thực trong trình duyệt, SKIP để dừng): ':'Tự xác thực trong trình duyệt, sau đó nhấn Enter để tiếp tục; SKIP để dừng: ';
++ const entered=(await getCli().question(label)).trim();
++ if(entered.toUpperCase()==='SKIP')return false;
++ if(entered && task.challengeInputSelector){
++  const input=page.locator(task.challengeInputSelector);
++  if(await input.count()!==1)throw new Error('Challenge input is not unique; manual browser action required');
++  await input.fill(entered);
++  if(task.challengeVerifySelector){
++   const verify=page.locator(task.challengeVerifySelector);
++   if(await verify.count()!==1)throw new Error('Challenge verify action is not unique');
++   const label=(await verify.innerText().catch(()=>''))+' '+(await verify.getAttribute('value').catch(() => '')||'');
++   if(/submit all|finish attempt|nộp bài|turn in|submit assignment/i.test(label))throw new Error('Challenge verify selector is a final submission button');
++   await verify.click();
++  }
++ }
++ await page.waitForLoadState('domcontentloaded',{timeout:12000}).catch(()=>{});
++ const body=await page.evaluate(()=>(document.body?.innerText||'').slice(0,5000)).catch(()=>'');
++ return !(await isAuthRequired(page))&&!isLoginChallenge(body);
++ };
++ const job=authPromptQueue.then(work,work);
++ authPromptQueue=job.then(()=>undefined,()=>undefined);
++ return job;
++}
++
++
++export async function executeTask(
++  browserContext: BrowserContext,
++  task: Task,
++  config: AppConfig,
++  activeNoteVault: NoteVault = { global: '', byHost: {}, byTask: {} },
++  deadlinesCollector: Deadline[] = []
++): Promise<TaskResult> {
++ const result:TaskResult={id:task.id,url:task.url,title:task.title||task.id,status:'ERROR',startedAt:new Date().toISOString(),questionsFound:0,questionsFilled:0,warnings:[],scoreObserved:null};
++ const filePaths=[...(config.answerFilePaths||[]),...(task.answerFilePaths||[])];
++ // Fail only this task, before contacting the LMS, if an explicitly selected answer file is malformed.
++ let answerBank: Awaited<ReturnType<typeof loadAnswerBanks>>;
++ try { answerBank=await loadAnswerBanks(filePaths); }
++ catch(e) {
++  result.status='NEEDS_REVIEW';
++  result.warnings.push(`[ANSWER_FILE_ERROR] ${e instanceof Error ? e.message : String(e)}. The file must be corrected before this task runs.`);
++  return result;
++ }
++ const page=await browserContext.newPage();
++ result.page=page;
++  const effectiveMode = resolveEffectiveOperationMode(config, task);
++  if (effectiveMode !== 'READ_ONLY') {
++    const activeRO = contextActiveReadOnlyTasks.get(browserContext) || 0;
++    if (activeRO === 0) {
++      const prevHandler = contextBlockHandlers.get(browserContext);
++      if (prevHandler) {
++        await browserContext.unroute('**/*', prevHandler).catch(() => {});
++        contextBlockHandlers.delete(browserContext);
++      }
++    }
++  } else {
++    const activeRO = (contextActiveReadOnlyTasks.get(browserContext) || 0) + 1;
++    contextActiveReadOnlyTasks.set(browserContext, activeRO);
++  }
++  let contextBlockHandler: ((route: any) => Promise<void>) | null = null;
++  let popupListener: ((popup: any) => void) | null = null;
++  try {
++   const originOpts = originTrustFromConfig(config);
++   ensureAllowed(task.url, config.allowedHosts, originOpts);
++   // Pilot-Gate Phase 5: refuse action/mutation endpoints BEFORE any network request is issued (all modes).
++   if (isStateMutatingActionUrl(task.url)) {
++    result.status = 'NEEDS_REVIEW';
++    result.warnings.push(`${effectiveMode === 'READ_ONLY' ? '[READ_ONLY] ' : ''}Chặn điều hướng tới URL có thể thay đổi trạng thái (tạo lượt làm bài/lưu nháp/nộp/đăng xuất/ghi danh): ${redactSecrets(task.url)}; không gửi request nào`);
++    return result;
++   }
++   if (effectiveMode === 'READ_ONLY') {
++      result.readOnlyBlockedRequests = [];
++      contextBlockHandler = async (route: any) => {
++        const req = route.request();
++        const method = req.method().toUpperCase();
++        const reqUrl = req.url();
++        if (isMutatingHttpMethod(method) || isStateMutatingActionUrl(reqUrl)) {
++          result.readOnlyBlockedRequests!.push(method + ' ' + redactSecrets(reqUrl));
++          warn('[READ_ONLY_BLOCK] Bat chan yeu cau ghi: ' + method + ' ' + redactSecrets(reqUrl));
++          return route.abort('blockedbyclient');
++        }
++        if (req.isNavigationRequest()) {
++          try {
++            const response = await route.fetch({ maxRedirects: 0 });
++            const status = response.status();
++            if (status >= 300 && status < 400) {
++              const loc = response.headers()['location'];
++              if (loc) {
++                const absLoc = new URL(loc, reqUrl).toString();
++                if (isStateMutatingActionUrl(absLoc)) {
++                  result.readOnlyBlockedRequests!.push('REDIRECT ' + absLoc);
++                  warn('[READ_ONLY_BLOCK] Bat chan chuyen huong toi URL hanh vi: ' + redactSecrets(absLoc));
++                  return route.abort('blockedbyclient');
++                }
++              }
++            }
++            return route.fulfill({ response });
++          } catch {
++            return route.abort('blockedbyclient');
++          }
++        }
++        return route.continue();
++      };
++      contextBlockHandlers.set(browserContext, contextBlockHandler);
++      await browserContext.route('**/*', contextBlockHandler);
++      await page.route('**/*', contextBlockHandler);
++      popupListener = (popup: any) => {
++        if (contextBlockHandler) {
++          popup.route('**/*', contextBlockHandler).catch(() => {});
++        }
++      };
++      browserContext.on('page', popupListener);
++      await page.addInitScript(() => {
++        try {
++          Object.defineProperty(navigator, 'serviceWorker', {
++            get: () => undefined,
++            configurable: false
++          });
++        } catch {}
++      }).catch(() => {});
++      await page.evaluate(() => {
++        if ('serviceWorker' in navigator && navigator.serviceWorker.getRegistrations) {
++          navigator.serviceWorker.getRegistrations().then(regs => {
++            for (const r of regs) r.unregister();
++          }).catch(() => {});
++        }
++      }).catch(() => {});
++    }
++   const dup=await checkDuplicateRisk(task.id,task.url);
++  if(dup.isDuplicateRisk && !task.allowResubmit && !config.forceResubmit){
++   warn(`  [CHẶN TRÙNG LẶP] ${dup.message}`);
++   result.status='NEEDS_REVIEW';
++   result.warnings.push(`ĐÃ CHẶN: ${dup.message}. Cần task.allowResubmit=true để thực hiện lại.`);
++   return result;
++  }
++  const existingCheckpoint = await loadCheckpoint(task.id);
++  const recordedAnswers: Record<string, any> = {};
++  const answersByStep: Record<number, Record<string, any>> = {};
++  if (existingCheckpoint?.answersRecorded) {
++    Object.assign(recordedAnswers, existingCheckpoint.answersRecorded);
++  }
++  if (existingCheckpoint?.answersByStep) {
++    Object.assign(answersByStep, existingCheckpoint.answersByStep);
++  }
++  let startingPageIndex = 0;
++  let policyCleared = false;
++  if (existingCheckpoint) {
++    info(`  [Checkpoint] Phát hiện checkpoint cho ${task.id} (Bước: ${existingCheckpoint.stepsCompleted}/${existingCheckpoint.totalSteps || '?'})`);
++  }
++   try {
++    await resilientGoto(page, task.url);
++   } catch (gotoErr) {
++    if (result.readOnlyBlockedRequests?.length) {
++     result.status = 'NEEDS_REVIEW';
++     result.warnings.push(`[READ_ONLY] Điều hướng bị chặn vì dẫn tới request thay đổi trạng thái: ${result.readOnlyBlockedRequests.join(', ')}`);
++     return result;
++    }
++    throw gotoErr;
++   }
++  try {
++    ensureAllowed(page.url(), config.allowedHosts, originOpts);
++  } catch (redirectErr) {
++    const redirectBody = await page.evaluate(() => (document.body?.innerText || '').slice(0, 12000)).catch(() => '');
++    if (isApprovedSsoOrigin(page.url(), config) && ((await isAuthRequired(page)) || isLoginChallenge(redirectBody))) {
++      result.status = 'WAITING_FOR_AUTH';
++      result.warnings.push(`Trang chuyển hướng tới cổng xác thực SSO được phê duyệt (${new URL(page.url()).origin}); vui lòng đăng nhập thủ công`);
++      return result;
++    }
++    result.status = 'NEEDS_REVIEW';
++    result.warnings.push(
++      `Chặn chuyển hướng tới origin ngoài danh sách cho phép (${page.url()}): ${redirectErr instanceof Error ? redirectErr.message : String(redirectErr)}`
++    );
++    return result;
++  }
++  result.title = (await page.title().catch(() => '')) || task.title || task.id;
++  const existingGrade = await observeScore(page);
++  if (existingGrade) result.scoreObserved = existingGrade.text;
++  const detectedPlatform = await detectPlatform(page, config.allowedHosts, config.moodleHosts);
++  info(`  Platform detected: ${detectedPlatform} / ${task.id}`);
++  const currentDeadlines = await scanDeadlines(page, config.deadlineOffset || '+07:00');
++  if (currentDeadlines[0]) result.deadline = currentDeadlines[0].dueAt;
++  deadlinesCollector.push(...currentDeadlines);
++
++  const authRequired=await isAuthRequired(page);
++  const initialBody = await page.evaluate(() => (document.body?.innerText || '').slice(0, 12000)).catch(() => '');
++  if (authRequired || isLoginChallenge(initialBody)) {
++    const recovered=await resumeAfterManualChallenge(page,task,config);
++    if(!recovered){
++      result.status='WAITING_FOR_AUTH';
++      result.warnings.push('Cần người dùng tự lấy và xác thực CAPTCHA/OTP/SSO; sau khi hoàn tất có thể khôi phục tác vụ');
++      return result;
++    }
++    try { ensureAllowed(page.url(),config.allowedHosts,originOpts); }
++    catch {result.status='NEEDS_REVIEW';result.warnings.push('Origin after authentication is outside the approved LMS scope');return result;}
++  }
++
++  if (effectiveMode === 'READ_ONLY') {
++    const roGates = await observeAccess(page);
++    const roWaiting = mostRestrictive(roGates);
++    if (roWaiting) {
++      result.accessGate = { kind: roWaiting.kind, reason: roWaiting.reason, remainingSeconds: roWaiting.remainingSeconds, recheckAfter: roWaiting.recheckAfter };
++    }
++    for (const frame of readableFrames(page, config.allowedHosts, originOpts)) {
++      result.questionsFound += (await scanQuestions(frame)).length;
++    }
++    // Give background scripts a short window to attempt writes so an impure page is never reported as purely read.
++    await page.waitForTimeout(400);
++    result.status = 'NEEDS_REVIEW';
++    result.warnings.push('[READ_ONLY] Chế độ chỉ đọc: chỉ quan sát metadata/hạn nộp/điểm số, không mở lượt làm bài và không điền biểu mẫu');
++    return result;
++  }
++
++  const headingContext = await page
++    .evaluate(() => Array.from(document.querySelectorAll('h1, h2, .page-header-headings')).map(e => (e.textContent || '').trim()).join(' '))
++    .catch(() => '');
++  const liveHeaderScope = classifyActivityScope(`${task.title || ''} ${result.title} ${headingContext}`);
++  if (effectiveMode === 'ASSESSMENT_RESTRICTED' || liveHeaderScope.scope === 'ASSESSMENT_RESTRICTED') {
++    result.status = 'NEEDS_REVIEW';
++    result.warnings.push(
++      `[ASSESSMENT_RESTRICTED] Đã chặn tự động thao tác trên bài kiểm tra/thi tính điểm (${liveHeaderScope.evidence})`
++    );
++    return result;
++  }
++
++  if (existingCheckpoint) {
++    // If task.url is an overview/launch page (e.g. Moodle /mod/quiz/view.php) with no questions directly visible,
++    // navigate to the saved attempt step URL (same allowed origin) or continue the existing attempt without starting a new one.
++    if (!await hasQuestions(page, config.allowedHosts, originOpts) && !mostRestrictive(await observeAccess(page))) {
++      if (existingCheckpoint.currentStepUrl && existingCheckpoint.currentStepUrl !== page.url()) {
++        try {
++          const stepUrl = ensureAllowed(existingCheckpoint.currentStepUrl, config.allowedHosts, originOpts);
++          const taskOrigin = ensureAllowed(task.url, config.allowedHosts, originOpts).origin.toLowerCase();
++          if (stepUrl.origin.toLowerCase() === taskOrigin) {
++            await resilientGoto(page, existingCheckpoint.currentStepUrl);
++          }
++        } catch {}
++        try {
++          ensureAllowed(page.url(), config.allowedHosts, originOpts);
++        } catch (stepRedirectErr) {
++          if (isApprovedSsoOrigin(page.url(), config) && (await isAuthRequired(page))) {
++            result.status = 'WAITING_FOR_AUTH';
++            result.warnings.push(`Phiên đăng nhập hết hạn khi khôi phục checkpoint; chuyển tới SSO (${new URL(page.url()).origin})`);
++            return result;
++          }
++          result.status = 'NEEDS_REVIEW';
++          result.warnings.push(
++            `Chuyển hướng ngoài origin cho phép khi khôi phục checkpoint: ${stepRedirectErr instanceof Error ? stepRedirectErr.message : String(stepRedirectErr)}`
++          );
++          return result;
++        }
++        if (await isAuthRequired(page)) {
++          result.status = 'WAITING_FOR_AUTH';
++          result.warnings.push('Phiên làm việc đã hết hạn khi khôi phục checkpoint; vui lòng đăng nhập lại');
++          return result;
++        }
++      }
++      if (!await hasQuestions(page, config.allowedHosts, originOpts)) {
++        const resumeLaunch = await inspectQuizLaunchSurface(page, config.allowedHosts, task.title, originOpts);
++        if (resumeLaunch.scope === 'ASSESSMENT_RESTRICTED') {
++          result.status = 'NEEDS_REVIEW';
++          result.warnings.push(`[ASSESSMENT_RESTRICTED] Dừng khôi phục trên bài kiểm tra tính điểm: ${resumeLaunch.scopeEvidence}`);
++          return result;
++        }
++        if (resumeLaunch.hasContinueAttemptControl) {
++          if (effectiveMode !== 'PRACTICE_ASSISTED' || resumeLaunch.scope !== 'PRACTICE_VERIFIED') {
++            result.status = 'NEEDS_REVIEW';
++            result.warnings.push(
++              `Dừng khôi phục: tiếp tục lượt đang mở cần mode=\"PRACTICE_ASSISTED\" tường minh và phạm vi tự luyện đã xác minh (mode hiệu lực: ${effectiveMode ?? 'chưa đặt'}; phạm vi: ${resumeLaunch.scope} — ${resumeLaunch.scopeEvidence}); không tạo lượt mới thay thế`
++            );
++            return result;
++          }
++          await revealContinue(page, config.allowedHosts, originOpts);
++          ensureAllowed(page.url(), config.allowedHosts, originOpts);
++          policyCleared = true;
++        } else if (resumeLaunch.hasNewAttemptControl || resumeLaunch.hasStartAttemptForm || resumeLaunch.exhaustedAttempts) {
++          result.status = 'NEEDS_REVIEW';
++          result.warnings.push(
++            'Checkpoint phát hiện lượt làm bài trước không còn mở trên server (chỉ thấy nút tạo lượt mới hoặc đã hết lượt); dừng NEEDS_REVIEW để chống tạo lượt làm bài trùng lặp'
++          );
++          return result;
++        }
++      }
++    }
++    const resumeEval = await ResumeCoordinator.evaluateState(page, existingCheckpoint, config);
++    if (resumeEval.state === 'WAITING_FOR_AUTH') {
++      warn(`  [ResumeCoordinator] ${resumeEval.reason}`);
++      result.status = 'WAITING_FOR_AUTH';
++      result.warnings.push(resumeEval.reason);
++      return result;
++    }
++    if (resumeEval.state === 'WAITING_FOR_ACCESS') {
++      warn(`  [ResumeCoordinator] ${resumeEval.reason}`);
++      result.status = 'WAITING_FOR_ACCESS';
++      if (resumeEval.accessGate) {
++        result.accessGate = { kind: resumeEval.accessGate.kind, reason: resumeEval.accessGate.reason, remainingSeconds: resumeEval.accessGate.remainingSeconds, recheckAfter: resumeEval.accessGate.recheckAfter };
++      }
++      result.warnings.push(resumeEval.reason);
++      return result;
++    }
++    if (resumeEval.state === 'NEEDS_REVIEW' || resumeEval.state === 'COMPLETED_VERIFIED') {
++      info(`  [ResumeCoordinator] ${resumeEval.reason}`);
++      result.status = 'NEEDS_REVIEW';
++      result.warnings.push(`Checkpoint: ${resumeEval.reason}`);
++      return result;
++    }
++    if (resumeEval.state === 'STATE_MISMATCH') {
++      warn(`  [ResumeCoordinator] Không thể khôi phục: ${resumeEval.reason}`);
++      result.warnings.push(`Checkpoint: ${resumeEval.reason}`);
++      result.status = 'NEEDS_REVIEW';
++      return result;
++    }
++    if (resumeEval.state === 'NAVIGATION_REQUIRED') {
++      info(`  [ResumeCoordinator] Tự động chuyển tiếp từ bước ${resumeEval.currentStep} đến bước ${resumeEval.targetStep}`);
++      const advanced = await ResumeCoordinator.advanceToStep(page, existingCheckpoint, resumeEval.targetStep, config, task.nextButton);
++      if (!advanced) {
++        warn(`  [ResumeCoordinator] Chuyển tiếp bước không thành công`);
++        result.status = 'NEEDS_REVIEW';
++        result.warnings.push(`Không thể chuyển tiếp an toàn đến bước ${resumeEval.targetStep}`);
++        return result;
++      }
++      startingPageIndex = resumeEval.targetStep - 1;
++    } else if (resumeEval.state === 'RESUME_READY') {
++      info(`  [ResumeCoordinator] ${resumeEval.reason}`);
++      startingPageIndex = Math.max(0, resumeEval.currentStep - 1);
++    }
++    if (startingPageIndex > 0) {
++      result.questionsFound = existingCheckpoint.questionsFound || 0;
++      result.questionsFilled = existingCheckpoint.questionsFilled || 0;
++    }
++  } else {
++    if (!await hasQuestions(page, config.allowedHosts, originOpts) &&
++        /no more attempts are allowed|không còn lượt làm bài|bạn đã hoàn thành bài kiểm tra|your response has been recorded|câu trả lời của bạn đã được ghi nhận/i.test(initialBody)) {
++      result.status = 'NEEDS_REVIEW';
++      result.warnings.push('Hoạt động đã hoàn thành hoặc không còn lượt làm bài mới; chỉ ghi nhận kết quả, không tự động thực thi lại');
++      return result;
++    }
++  }
++  const visited = new Set<string>();
++  let complete = true;
++  let gateCleared = false;
++  let scopeVerifiedRecord: TaskCheckpoint['scopeVerified'] = existingCheckpoint?.scopeVerified;
++  let anySupported = false;
++  let hasUnsupportedOrHumanOnly = false;
++  let serverSavedSteps = existingCheckpoint?.serverSavedSteps ?? startingPageIndex;
++  for (let pageIndex = startingPageIndex; pageIndex < (task.maxPages || 1); pageIndex++) {
++    try {
++      ensureAllowed(page.url(), config.allowedHosts, originOpts);
++    } catch (loopOriginErr) {
++      if (isApprovedSsoOrigin(page.url(), config) && (await isAuthRequired(page))) {
++        result.status = 'WAITING_FOR_AUTH';
++        result.warnings.push(`Chuyển hướng tới SSO được phê duyệt (${new URL(page.url()).origin})`);
++      } else {
++        result.status = 'NEEDS_REVIEW';
++        result.warnings.push(
++          `Origin không được phê duyệt (${page.url()}): ${loopOriginErr instanceof Error ? loopOriginErr.message : String(loopOriginErr)}`
++        );
++      }
++      complete = false;
++      break;
++    }
++    if (await isAuthRequired(page)) {
++      result.status = 'WAITING_FOR_AUTH';
++      result.warnings.push('Trang yêu cầu đăng nhập / xác thực tài khoản');
++      complete = false;
++      break;
++    }
++    const gates = await observeAccess(page);
++    for (const g of gates.filter(g => !g.blocked)) result.warnings.push(`${g.kind}: ${g.reason}`);
++    let waiting = mostRestrictive(gates);
++    if (waiting && (config.accessWatchMinutes || 0) > 0) {
++      info(`${task.id}: ${waiting.kind} — monitoring availability, no gate bypass or synthetic reading`);
++      const observed = await watchUntilAccessible(() => observeAccess(page), config.accessWatchMinutes || 0);
++      waiting = observed.ready ? undefined : observed.gate;
++    }
++    if (waiting) {
++      result.status = 'WAITING_FOR_ACCESS';
++      result.accessGate = { kind: waiting.kind, reason: waiting.reason, remainingSeconds: waiting.remainingSeconds, recheckAfter: waiting.recheckAfter };
++      result.warnings.push(waiting.reason);
++      await saveCheckpoint({
++        taskId: task.id,
++        url: task.url,
++        currentStepUrl: page.url(),
++        status: 'WAITING_FOR_ACCESS',
++        stepsCompleted: pageIndex,
++        totalSteps: task.maxPages || 1,
++        questionsFound: result.questionsFound,
++        questionsFilled: result.questionsFilled,
++        answersRecorded: recordedAnswers,
++        answersByStep: answersByStep,
++        ...(scopeVerifiedRecord ? { scopeVerified: scopeVerifiedRecord } : {}),
++        lastUpdated: new Date().toISOString()
++      });
++      break;
++    }
++    if (!existingCheckpoint && pageIndex === 0 && !await hasQuestions(page, config.allowedHosts, originOpts)) {
++      const launchInspection = await inspectQuizLaunchSurface(page, config.allowedHosts, task.title, originOpts);
++      const startDecision = await evaluateQuizStartPolicy({
++        page,
++        task,
++        config,
++        platform: detectedPlatform,
++        inspection: launchInspection
++      });
++      if (startDecision.action === 'HALT_NEEDS_REVIEW') {
++        result.status = 'NEEDS_REVIEW';
++        result.warnings.push(startDecision.reason);
++        complete = false;
++        break;
++      }
++      let launched = false;
++      if (startDecision.action === 'CONTINUE_EXISTING_ATTEMPT') {
++        launched = await revealContinue(page, config.allowedHosts, originOpts);
++      } else if (startDecision.action === 'START_NEW_ATTEMPT') {
++        launched = await revealStart(page, config.allowedHosts, { ...originOpts, allowNewAttempt: true });
++      }
++      if (launched) {
++        policyCleared = true;
++        try {
++          ensureAllowed(page.url(), config.allowedHosts, originOpts);
++        } catch (afterLaunchErr) {
++          if (isApprovedSsoOrigin(page.url(), config) && (await isAuthRequired(page))) {
++            result.status = 'WAITING_FOR_AUTH';
++            result.warnings.push(`Yêu cầu xác thực SSO sau khi mở hoạt động (${new URL(page.url()).origin})`);
++          } else {
++            result.status = 'NEEDS_REVIEW';
++            result.warnings.push(
++              `Origin không hợp lệ sau khi mở hoạt động: ${afterLaunchErr instanceof Error ? afterLaunchErr.message : String(afterLaunchErr)}`
++            );
++          }
++          complete = false;
++          break;
++        }
++        if (await isAuthRequired(page)) {
++          result.status = 'WAITING_FOR_AUTH';
++          result.warnings.push('Trang yêu cầu đăng nhập sau khi mở hoạt động');
++          complete = false;
++          break;
++        }
++        const gateAfterStart = mostRestrictive(await observeAccess(page));
++        if (gateAfterStart) {
++          result.status = 'WAITING_FOR_ACCESS';
++          result.accessGate = { kind: gateAfterStart.kind, reason: gateAfterStart.reason, remainingSeconds: gateAfterStart.remainingSeconds, recheckAfter: gateAfterStart.recheckAfter };
++          result.warnings.push(gateAfterStart.reason);
++          break;
++        }
++      }
++    }
++    // Unified pre-solve gate: direct attempt URLs, checkpoint resume, Task Queue retries and page transitions all revalidate here.
++    if (await hasQuestions(page, config.allowedHosts, originOpts)) {
++      const gate = await evaluateAttemptExecutionGate({
++        page,
++        task,
++        config,
++        platform: detectedPlatform,
++        checkpoint: existingCheckpoint,
++        policyCleared
++      });
++      if (!gate.allowed) {
++        result.status = 'NEEDS_REVIEW';
++        result.warnings.push(`[ATTEMPT_GATE:${gate.code}] ${gate.reason}`);
++        complete = false;
++        break;
++      }
++      gateCleared = true;
++      if (detectedPlatform === 'moodle' && effectiveMode === 'PRACTICE_ASSISTED') {
++        const idInfo = extractQuizActivityIdentity(page.url());
++        scopeVerifiedRecord = {
++          scope: 'PRACTICE_VERIFIED',
++          mode: 'PRACTICE_ASSISTED',
++          origin: new URL(page.url()).origin,
++          verifiedAt: new Date().toISOString(),
++          taskId: task.id,
++          cmid: idInfo.cmid || (scopeVerifiedRecord as any)?.cmid,
++          quizId: idInfo.quizId || (scopeVerifiedRecord as any)?.quizId,
++          attemptId: idInfo.attemptId || (scopeVerifiedRecord as any)?.attemptId,
++          source: 'ATTEMPT_PAGE_VERIFIED'
++        };
++      }
++    }
++    const surfaces = await readSurfaces(page, config.allowedHosts, originOpts);
++    let pageQuestions = 0;
++    for (const { frame, url } of surfaces) {
++      const framePlatform = await detectPlatform(frame, config.allowedHosts, config.moodleHosts);
++      const unsupported = await scanUnsupported(frame);
++      if (unsupported.length) {
++        hasUnsupportedOrHumanOnly = true;
++        complete = false;
++        result.warnings.push(...unsupported.map(x => `${framePlatform}: ${x}`));
++      }
++      const questions = await scanQuestions(frame);
++      if (!questions.length) continue;
++      pageQuestions += questions.length;
++      const actionable = questions.filter(q => q.kind !== 'unsupported' && !q.humanOnly);
++      if (actionable.length > 0) anySupported = true;
++      const fingerprint = url + '|' + questions.map(q => q.prompt + ':' + q.options.map(o => o.text).join('|')).join('||');
++      if (visited.has(fingerprint)) {
++        complete = false; result.warnings.push('Câu hỏi/trang bị lặp, cần kiểm tra thủ công'); break;
++      }
++      visited.add(fingerprint);
++      result.questionsFound += questions.length;
++      const {bankAnswers,unmatched}=splitBankAndAi(actionable, answerBank);
++      if (bankAnswers.length) result.warnings.push(`[ANSWER_BANK] ${bankAnswers.length} câu lấy từ tệp đáp án đã chọn; ${unmatched.length} câu cần AI`);
++      const aiAnswers = unmatched.length
++        ? await solveQuestions(page, unmatched, config, frame, notesFor(activeNoteVault, task.id, task.url, task.note))
++        : [];
++      const answers = [...bankAnswers, ...aiAnswers];
++      const byId = new Map(answers.map(a => [a.id, a]));
++      const stepAnswers: Record<string, any> = {};
++      for (const q of questions) {
++        if (q.kind === 'unsupported') {
++          hasUnsupportedOrHumanOnly = true;
++          complete = false;
++          result.warnings.push(`UNSUPPORTED [${q.id}${q.sourceType ? `/${q.sourceType}` : ''}]: ${q.unsupportedReason || 'Loại câu hỏi chưa hỗ trợ; cần xem xét thủ công'}`);
++          continue;
++        }
++        if (q.humanOnly) {
++          hasUnsupportedOrHumanOnly = true;
++          complete = false;
++          result.warnings.push(`HUMAN_ONLY [${q.id}]: ${q.humanOnly}`);
++          continue;
++        }
++        const answer = byId.get(q.id);
++        if (!answer) { complete = false; result.warnings.push(`Chưa có câu trả lời: ${url}/${q.id}`); continue; }
++        if (answer.confidence !== undefined && answer.confidence < 0.6) {
++          result.warnings.push(`LOW_CONFIDENCE [${q.id}]: Model tự báo confidence=${answer.confidence.toFixed(2)} (<0.60); cần người học kiểm tra kỹ đáp án`);
++        }
++        try {
++          await fillAnswer(frame, q, answer);
++          result.questionsFilled++;
++          const recorded = { selected: answer.selected, text: answer.text, fileName: answer.fileName };
++          stepAnswers[q.id] = recorded;
++          recordedAnswers[q.id] = recorded;
++        }
++        catch (e) { complete = false; result.warnings.push(`Không điền được ${q.id}: ${e instanceof Error ? e.message : String(e)}`); }
++      }
++      answersByStep[pageIndex + 1] = { ...(answersByStep[pageIndex + 1] || {}), ...stepAnswers };
++    }
++    if (!pageQuestions) { result.warnings.push('Không tìm thấy trường hỗ trợ trên trang hoặc iframe đã cấp quyền'); complete = false; break; }
++    const preNavStepUrl = page.url();
++    await saveCheckpoint({
++      taskId: task.id,
++      url: task.url,
++      currentStepUrl: preNavStepUrl,
++      status: 'RUNNING',
++      stepsCompleted: pageIndex + 1,
++      domFilledSteps: pageIndex + 1,
++      serverSavedSteps,
++      totalSteps: task.maxPages || 1,
++      questionsFound: result.questionsFound,
++      questionsFilled: result.questionsFilled,
++      answersRecorded: recordedAnswers,
++      answersByStep: answersByStep,
++      ...(scopeVerifiedRecord ? { scopeVerified: scopeVerifiedRecord } : {}),
++      lastUpdated: new Date().toISOString()
++    });
++    if (!complete) break;
++    if (pageIndex === ((task.maxPages || 1) - 1)) {
++      const next = await locateNext(page, config.allowedHosts, task.nextButton, originOpts);
++      // Avoid falsely reporting READY when more pages exist beyond the configured limit.
++      if (hasUnvisitedPages(pageIndex, task.maxPages || 1, Boolean(next))) {
++        complete = false;
++        result.warnings.push(`Reached maxPages=${task.maxPages || 1} but the site still has a Next page`);
++      }
++      break;
++    }
++
++    // Unified Observe -> Act -> Verify page navigation (Phase 4: AUD-114-05)
++    const navResult = await executeVerifiedNavigation(page, config, task.nextButton, pageIndex + 1);
++    if (!navResult.success) {
++      if (navResult.state === 'SUBMIT_GUARD') {
++        // Submit page reached safely; current step remains DOM-filled only until explicit user submit
++        break;
++      }
++      if (navResult.state === 'AUTH_REQUIRED') {
++        result.status = 'WAITING_FOR_AUTH';
++      } else if (navResult.state === 'ACCESS_RESTRICTED') {
++        result.status = 'WAITING_FOR_ACCESS';
++      } else if (navResult.state === 'HOST_MISMATCH' || navResult.state === 'NEEDS_REVIEW') {
++        result.status = 'NEEDS_REVIEW';
++      } else if (navResult.state === 'ERROR') {
++        // Server / HTTP error during page transition: roll back stepsCompleted to confirmed serverSavedSteps
++        // so unpersisted DOM edits are never falsely recorded as server-saved.
++        await saveCheckpoint({
++          taskId: task.id,
++          url: task.url,
++          currentStepUrl: preNavStepUrl,
++          status: 'PARTIAL',
++          stepsCompleted: serverSavedSteps,
++          domFilledSteps: pageIndex + 1,
++          serverSavedSteps,
++          lastSaveError: navResult.reason,
++          totalSteps: task.maxPages || 1,
++          questionsFound: result.questionsFound,
++          questionsFilled: result.questionsFilled,
++          answersRecorded: recordedAnswers,
++          answersByStep: answersByStep,
++          ...(scopeVerifiedRecord ? { scopeVerified: scopeVerifiedRecord } : {}),
++          lastUpdated: new Date().toISOString()
++        });
++      }
++      complete = false;
++      result.warnings.push(`Dừng chuyển trang ở bước ${pageIndex + 1}: ${navResult.reason}`);
++      break;
++    }
++    serverSavedSteps = pageIndex + 1;
++    await saveCheckpoint({
++      taskId: task.id,
++      url: task.url,
++      currentStepUrl: preNavStepUrl,
++      status: 'RUNNING',
++      stepsCompleted: pageIndex + 1,
++      domFilledSteps: pageIndex + 1,
++      serverSavedSteps,
++      totalSteps: task.maxPages || 1,
++      questionsFound: result.questionsFound,
++      questionsFilled: result.questionsFilled,
++      answersRecorded: recordedAnswers,
++      answersByStep: answersByStep,
++      ...(scopeVerifiedRecord ? { scopeVerified: scopeVerifiedRecord } : {}),
++      lastUpdated: new Date().toISOString()
++    });
++  }
++  if(!anySupported)complete=false;
++  if(result.status!=='WAITING_FOR_ACCESS' && result.status!=='WAITING_FOR_AUTH' && result.status!=='NEEDS_REVIEW'){
++   if(readyForReview({supported:anySupported,complete,filled:result.questionsFilled,found:result.questionsFound,waiting:false})){
++    result.status='READY_FOR_REVIEW';
++   }else if(hasUnsupportedOrHumanOnly && result.questionsFilled===0){
++    result.status='NEEDS_REVIEW';
++   }else{
++    result.status='PARTIAL';
++   }
++  }
++  if(result.questionsFilled!==result.questionsFound)result.warnings.push('Còn câu chưa điền; không được tự nộp');
++ }catch(e){result.warnings.push(redactSecrets(e instanceof Error?e.message:String(e)));result.status='ERROR';}
++ finally {
++    const effMode = resolveEffectiveOperationMode(config, task);
++    if (effMode === 'READ_ONLY') {
++      const remainingRO = Math.max(0, (contextActiveReadOnlyTasks.get(browserContext) || 1) - 1);
++      contextActiveReadOnlyTasks.set(browserContext, remainingRO);
++    }
++    if (popupListener) {
++      browserContext.off('page', popupListener);
++    }
++    if (result.readOnlyBlockedRequests?.length) {
++      result.warnings.push(`[READ_ONLY_WRITE_BLOCKED] Đã chặn ${result.readOnlyBlockedRequests.length} request có thể thay đổi trạng thái: ${result.readOnlyBlockedRequests.slice(0, 5).join(", ")}`);
++      if (result.status === 'READY_FOR_REVIEW' || result.status === 'PARTIAL') result.status = 'NEEDS_REVIEW';
++    }
++    result.finishedAt = new Date().toISOString();
++  }
++ return result;
++}
++
++export async function createReadOnlyContext(browser: any, options: any = {}): Promise<BrowserContext> {
++  return browser.newContext({
++    serviceWorkers: 'block',
++    acceptDownloads: true,
++    viewport: { width: 1280, height: 900 },
++    ...options
++  });
++}
++
++export async function prepareTask(task:Task,config:AppConfig):Promise<TaskResult> {
++  const effectiveMode = resolveEffectiveOperationMode(config, task);
++  if (effectiveMode === 'READ_ONLY' && config.operationMode !== 'READ_ONLY' && context) {
++    const browser = context.browser();
++    if (browser) {
++      const roContext = await browser.newContext({
++        serviceWorkers: 'block',
++        acceptDownloads: true,
++        viewport: { width: 1280, height: 900 }
++      });
++      try {
++        return await executeTask(roContext, task, config, noteVault, deadlines);
++      } finally {
++        await roContext.close().catch(() => {});
++      }
++    }
++  }
++  return executeTask(context!, task, config, noteVault, deadlines);
++}
++async function parallelMap<T,U>(list:T[],parallel:number,fn:(item:T)=>Promise<U>):Promise<U[]> {
++ const out=new Array<U>(list.length);let cursor=0;
++ await Promise.all(Array.from({length:Math.min(parallel,list.length)},async()=>{
++  while(cursor<list.length){const i=cursor++;out[i]=await fn(list[i]);}
++ }));return out;
++}
++async function confirmOne(task:Task,r:TaskResult,config:AppConfig):Promise<void>{
++ if(r.status!=='READY_FOR_REVIEW'){
++  warn(`Bỏ qua nộp ${task.id}: trạng thái ${r.status}`);return;
++ }
++ info(`${task.id}: đã điền ${r.questionsFilled}/${r.questionsFound}; chưa nộp.`);
++ let confirm=(await getCli().question(`Bài ${task.id} đã sẵn sàng. CHECK=xem lại trình duyệt, SUBMIT ${task.id}=nộp ngay, Enter=giữ chưa nộp: `)).trim();
++ if(confirm.toUpperCase()==='CHECK'){
++  info(`Kiểm tra ở cửa sổ trình duyệt: ${r.page?.url()||task.url}. Bạn không cần quan sát trong lúc agent chạy.`);
++  confirm=(await getCli().question(`Sau khi kiểm tra, gõ SUBMIT ${task.id} để nộp hoặc Enter để GIỮ NGUYÊN: `)).trim();
++ }
++ if(confirm!==`SUBMIT ${task.id}`){r.status='NOT_SUBMITTED';return;}
++ try {
++  const page=r.page!;
++  ensureAllowed(page.url(),config.allowedHosts,originTrustFromConfig(config));
++  const submitName=task.submitButton||/^(Submit|Submit all and finish|Submit quiz|Submit assignment|Turn in|Nộp bài|Gửi bài|Hoàn thành và nộp)$/i;
++  let submit=page.getByRole('button',{name:submitName,exact:typeof submitName==='string'});
++  // Moodle's "Finish attempt ..." opens a summary page, not a final submission. Do this
++  // intermediate navigation only after the explicit SUBMIT <taskId> confirmation above.
++  if((await submit.count())===0){
++   const finish=page.getByRole('button',{name:/^Finish attempt\s*(?:\.{3}|…)?$/i});
++   if((await finish.count())===1){
++    await finish.click();
++    await page.waitForLoadState('domcontentloaded',{timeout:12000}).catch(()=>{});
++    ensureAllowed(page.url(),config.allowedHosts,originTrustFromConfig(config));
++    submit=page.getByRole('button',{name:submitName,exact:typeof submitName==='string'});
++   }
++  }
++  if(await submit.count()!==1){r.status='NOT_SUBMITTED';r.warnings.push('Submit button not uniquely identified; leave to manual review');return;}
++  await submit.click();
++  // An explicit Moodle confirmation dialog may remain. Only click an unambiguous submit
++  // confirmation inside a dialog that visibly describes final submission.
++  const dialog=page.getByRole('dialog').filter({hasText:/submit all and finish|nộp bài|final submission/i});
++  if((await dialog.count())===1){
++   const final=dialog.getByRole('button',{name:/^(Submit all and finish|Nộp bài|Confirm submission|Xác nhận nộp)$/i});
++   if((await final.count())===1)await final.click();
++  }
++  r.status='UNCONFIRMED';
++  if(task.successText){
++   await page.getByText(task.successText,{exact:false}).first().waitFor({timeout:12000});
++   r.status='SUBMITTED';
++   await clearCheckpoint(task.id);
++  }
++  if(task.scoreSelector){const score=page.locator(task.scoreSelector);if(await score.count()===1)r.scoreObserved=(await score.innerText()).trim().slice(0,150);}
++  else {const grade=await observeScore(page);if(grade)r.scoreObserved=grade.text;}
++ }catch(e){r.status='UNCONFIRMED';r.warnings.push(`Nộp/chờ xác nhận: ${e instanceof Error?e.message:String(e)}`);}
++}
++async function main():Promise<void>{
++  await loadTheme();
++  const configPath = process.argv[2] || '.private/browser-task.json';
++  let config: AppConfig;
++  if (!existsSync(configPath)) {
++    header('BROWSER AGENT');
++    renderBreadcrumb(['COMMAND DECK', 'BROWSER AGENT', 'SETUP REQUIRED']);
++    renderErrorCard(
++      'Chưa tìm thấy cấu hình tác vụ (.private/browser-task.json)',
++      'Browser Agent cần danh sách website được phép và tác vụ để thực hiện.',
++      'Khởi chạy Setup Wizard tương tác để tạo cấu hình'
++    );
++    const configured = await browserSetupInteractive();
++    if (!configured || !existsSync(configPath)) {
++      warn('Chưa hoàn tất cấu hình Browser Agent. Quay lại menu.');
++      return;
++    }
++  }
++  config = await loadConfig(configPath);
++ noteVault=await loadNotes();
++ await loadTheme();
++ header('BROWSER AGENT');
++ section('Session overview');
++ entry('TASKS',String(config.tasks.length),'cyan');
++ entry('PARALLEL TABS',String(config.parallelTabs),'aqua');
++ entry('SUBMISSION','Approval per task','orange');
++ entry('AI NOTES',noteVault.global||Object.keys(noteVault.byHost).length||Object.keys(noteVault.byTask).length?'Configured':'None','cyan');
++ info('AI only on explicitly authorized tasks. CAPTCHA/MFA remains manual.');
++ const cli = getCli();
++ const accepted=(await cli.question('Gõ ACCEPT để bắt đầu, cho phép đọc nội dung bài và (nếu bật AI cloud) gửi nội dung cho nhà cung cấp: ')).trim();
++ if(accepted!=='ACCEPT'){warn('Đã hủy.');return;}
++ const answerFileInput=(await cli.question('Tệp đáp án JSON/CSV/TSV/TXT/MD (đường dẫn; Enter=giữ cấu hình): ')).trim();
++ if(answerFileInput)config.answerFilePaths=[...(config.answerFilePaths||[]),answerFileInput];
++ config.interactiveAuthRecovery=true;
++ if(!config.confirmAttemptStart){
++  config.confirmAttemptStart=async({taskId,title,buttonLabel,url})=>{
++   info(`[XÁC NHẬN MỞ LƯỢT TỰ LUYỆN MỚI] ${taskId} — "${title}" (${url}) yêu cầu bấm "${buttonLabel}".`);
++   const ans=(await cli.question(`Gõ chính xác START ${taskId} để xác nhận mở lượt tự luyện mới, hoặc Enter để GIỮ NGUYÊN (NEEDS_REVIEW): `)).trim();
++   return ans===`START ${taskId}`;
++  };
++ }
++ const mainOriginOpts=originTrustFromConfig(config);
++ const accountDb=await listAccounts();
++ const savedAccount=config.accountId?accountDb[config.accountId]:null;
++ if(config.accountId && !savedAccount)throw new Error(`Unknown account profile: ${config.accountId}. Run npm run accounts first.`);
++ const swOption = config.operationMode === 'READ_ONLY' ? 'block' : 'allow';
++
++ context=savedAccount?await accountContext(config.accountId!,savedAccount,{serviceWorkers:swOption}):await chromium.launchPersistentContext(resolve('.private','chromium-profile'),{headless:false,viewport:{width:1280,height:900},acceptDownloads:true,serviceWorkers:swOption});
++ if(savedAccount)await loginForContext(context,config.accountId!,savedAccount,q=>cli.question(q));
++ for(const url of config.authUrls||[]){
++  const page=await context.newPage();await page.goto(url,{waitUntil:'domcontentloaded'});
++  info(`Đăng nhập thủ công tại ${url} (bao gồm MFA nếu có).`);
++  await cli.question('Sau khi đăng nhập xong và quay về trang cho phép, nhấn Enter... ');
++  await page.close();
++ }
++ for(const url of config.deadlinePages||[]){
++  const page=await context.newPage();
++  try{await page.goto(url,{waitUntil:'domcontentloaded'});ensureAllowed(page.url(),config.allowedHosts,mainOriginOpts);
++      deadlines.push(...await scanDeadlines(page,config.deadlineOffset||'+07:00'));
++  }catch(e){warn(`Không thể quét lịch ${url}: ${e instanceof Error?e.message:String(e)}`);}
++  finally{await page.close();}
++ }
++ let tasks=config.tasks;
++ if(config.autoDiscover){
++  section('Automatic LMS discovery');
++  const seeds=config.discoveryStartUrls?.length?config.discoveryStartUrls:(config.deadlinePages?.length?config.deadlinePages:tasks.map(t=>t.url));
++  const found=await discoverActivities(context,seeds,config.allowedHosts,config.maxDiscoveryPages||25,config.deadlineOffset,mainOriginOpts);
++  deadlines.push(...found.deadlines);
++  const activities=found.activities;
++  for(let i=0;i<activities.length;i++)entry(`${i+1}. ${activities[i].kind}`,activities[i].title.slice(0,65));
++  for(const w of found.warnings)warn(w);
++  if(activities.length){
++   const pick=(await cli.question(`Select ALL, comma-separated indices (1..${activities.length}), or Enter to keep configured tasks: `)).trim();
++   if(pick.toUpperCase()==='ALL') tasks=[...tasks,...activities.map(toTask)];
++   else if(pick){
++    const ids=pick.split(',').map(x=>Number(x.trim())-1).filter(x=>Number.isInteger(x)&&x>=0&&x<activities.length);
++    tasks=[...tasks,...[...new Set(ids)].map(i=>toTask(activities[i]))];
++   }
++  }
++ }
++ tasks=[...new Map(tasks.map(t=>[t.url,t])).values()];
++ if(!tasks.length){warn('No tasks selected. Calendar scan/report only.');}
++ results=await parallelMap(tasks,config.parallelTabs,t=>prepareTask(t,config));
++ printSummary(results,deadlines);
++ for(let i=0;i<results.length;i++)await confirmOne(tasks[i],results[i],config);
++ printSummary(results,deadlines);
++ success('JSON report: '+await saveReport(results,deadlines));
++ const action=(await cli.question('Session: Enter=KEEP saved login, LOGOUT=clear cookies, FORGET=remove local browser session: ')).trim().toUpperCase();
++ if(action==='LOGOUT') {await context.clearCookies();info('Cookies cleared; website local storage may still retain session data. Use FORGET to remove it.');}
++ else if(action==='FORGET'&&config.accountId){await context.close();context=undefined;await forgetSession(config.accountId);success('Saved browser profile deleted; account credentials retained in OS vault.');}
++ else if(action==='FORGET'){await context.close();context=undefined;await (await import('node:fs/promises')).rm(resolve('.private','chromium-profile'),{recursive:true,force:true});}
++ else info('Saved browser session retained for next run.');
++}
++const isDirectRun = Boolean(
++  process.argv[1] &&
++  resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase()
++);
++if (isDirectRun) {
++  main().catch(e=>{fail('Browser Agent: '+redactSecrets(String(e)));process.exitCode=1;}).finally(async()=>{
++   await context?.close();close('SESSION CLOSED');cliInstance?.close();
++  });
++}
+--- a/src/setup.ts
++++ b/src/setup.ts
+@@ -196,8 +196,13 @@
+       tasks = existingConfig.tasks;
+     }
+ 
++    const modeInput=(await ask('Chế độ: READ_ONLY hoặc PRACTICE_ASSISTED (chỉ bài tự luyện được phép)', existingConfig?.operationMode||'READ_ONLY')).trim().toUpperCase();
++    if (!['READ_ONLY','PRACTICE_ASSISTED','ASSESSMENT_RESTRICTED'].includes(modeInput)) throw new Error('Chế độ không hợp lệ');
++    const answerFile=(await ask('Tệp đáp án có sẵn (JSON/CSV/TSV/TXT/MD, bỏ trống nếu chưa có)', existingConfig?.answerFilePaths?.[0]||'')).trim();
+     const config: AppConfig = {
++      ...(answerFile?{answerFilePaths:[answerFile]}:{}),
+       allowedHosts,
++      operationMode: modeInput as AppConfig['operationMode'],
+       approvedForAIUse: true,
+       parallelTabs,
+       accountId: chosenAccountId,
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -40,9 +40,11 @@
+   verifiedAt?: string;
+ }
+ 
+-export interface Answer { id: string; selected?: string[]; text?: string; fileName?: string; fileContent?: string; confidence?: number }
++export interface Answer { id: string; selected?: string[]; text?: string; fileName?: string; fileContent?: string; localFilePath?: string; confidence?: number }
+ export interface Task {
+-  id: string; url: string; title?: string; aiPermitted: boolean; submitButton?: string; nextButton?: string; maxPages?: number; successText?: string; scoreSelector?: string; note?:string; allowResubmit?: boolean;
++  id: string; url: string; title?: string; aiPermitted: boolean; submitButton?: string; nextButton?: string; maxPages?: number; successText?: string; scoreSelector?: string; note?:string; answerFilePaths?:string[];
++  /** Site-specific visible challenge fields; user supplies the value, never the AI. */
++  challengeInputSelector?: string; challengeVerifySelector?: string; allowResubmit?: boolean;
+   /** Explicit operating mode: READ_ONLY, PRACTICE_ASSISTED, or ASSESSMENT_RESTRICTED. */
+   mode?: LmsOperationMode;
+   /** Separate explicit confirmation required before clicking "Attempt quiz now" / creating a NEW self-practice attempt. */
+@@ -57,6 +59,10 @@
+ }
+ export interface AppConfig {
+   allowedHosts: string[];
++  /** Explicit local answer files (JSON, CSV, TSV, TXT, MD); checked before any AI call. */
++  answerFilePaths?: string[];
++  /** CLI challenge pauses; manual user solves CAPTCHA/OTP in browser, never automated bypass. */
++  interactiveAuthRecovery?: boolean;
+   /** Optional strict origin allowlist (e.g. ["https://lms.hust.edu.vn"]). */
+   allowedOrigins?: string[];
+   /** Whether local loopback http://127.0.0.1:<port> or http://localhost:<port> is allowed when explicitly listed in allowedHosts. Defaults to true when loopback host is in allowedHosts. */
+--- /dev/null
++++ b/examples/ANSWER_FILE_WORKFLOW.md
+@@ -0,0 +1,21 @@
++# AutoTask AI – answer-first workflow (candidate patch)
++
++Use only with forms and practice activities where you are permitted to automate and use AI.
++
++## Setup
++
++- Set `answerFilePaths` in `.private/browser-task.json`, e.g. `["]` is INVALID; example: `"answerFilePaths": ["C:/Users/Admin/Answers/answers.json"]`.
++- Or run `npm run browser`: after `ACCEPT`, enter a local answer-file path in Terminal. The Setup wizard also accepts one path.
++- Per-task overrides/additions: `"answerFilePaths": ["C:/Users/Admin/Answers/quiz-1.csv"]` under that task.
++- Supported answer-bank formats: `.json`, `.csv`, `.tsv`, `.txt`, `.md` (UTF-8); not yet native Excel/PDF/DOCX extraction. Use CSV or JSON export.
++- Rows match **exact** `stableId`, `id`, or normalized prompt. For choice questions, use full answer *text* or a current ID, not fixed letters A/B/C after shuffling.
++- `filePath` can point to an explicitly chosen local document (relative to the answer-bank file or absolute). Standard `<input type=file>` upload is supported; proprietary Moodle File Manager still needs its own adapter.
++- No automatic upload from a model-proposed local path. Invalid or ambiguous answers fall back to AI rather than guessing.
++
++## Terminal flow
++
++1. The agent reads the answer file, fills matches, and asks its configured AI model for missing items only.
++2. Authentication challenge: on a visible CAPTCHA/OTP/SSO page, user manually reads the challenge in Chromium, enters it there and presses Enter in Terminal. If a task specifies unique `challengeInputSelector` and `challengeVerifySelector`, the user may enter the manually obtained text in Terminal for the agent to fill the on-page input. There is no CAPTCHA solver or MFA bypass.
++3. At the end, enter `CHECK` to review in Chromium; enter `SUBMIT <taskId>` to authorize final submission without reviewing, or press Enter to keep the draft. Final submission can only be marked confirmed if a reliable site success signal exists.
++
++This patch has offline tests; it is not a guarantee of correctness or compatibility with a live LMS, custom theme, or grading policy. Keep quiz/attempt policy, allowedHosts, origin trust, and durable consent protections enabled.
+--- /dev/null
++++ b/examples/answer-bank.sample.csv
+@@ -0,0 +1,3 @@
++question,answer
++"Which city is the capital of France?",Paris
++"What does CPU stand for?","Central Processing Unit"
+--- /dev/null
++++ b/examples/answer-bank.sample.json
+@@ -0,0 +1,8 @@
++{
++  "answers": [
++    {"stableId":"question-7001-1","answer":"Paris"},
++    {"question":"Which transport protocol is connection-oriented?","answer":"TCP"},
++    {"id":"q3","text":"My independently prepared response."},
++    {"id":"q4","filePath":"./attachments/my-response.pdf"}
++  ]
++}
+--- /dev/null
++++ b/src/answer-bank.ts
+@@ -0,0 +1,146 @@
++/** Explicit user answer files: exact identifiers/prompts only, AI fallback for unmatched questions.
++ * The bank never runs code or evaluates formulas. Invalid/ambiguous answers remain unresolved.
++ */
++import { readFile, lstat } from 'node:fs/promises';
++import { extname, dirname, isAbsolute, resolve, basename } from 'node:path';
++import type { Question, Answer } from './types.js';
++
++const MAX_BANK_BYTES = 4 * 1024 * 1024;
++const MAX_ROWS = 5000;
++export interface AnswerBankRow {
++ id?: string; stableId?: string; question?: string; prompt?: string;
++ answer?: string; text?: string; selected?: string[] | string;
++ choiceText?: string[] | string; localFilePath?: string; filePath?: string;
++ fileName?: string; confidence?: number;
++}
++export interface AnswerBank { rows: AnswerBankRow[]; warnings: string[]; sources: string[] }
++const norm = (s: string) => String(s).normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
++
++function csvRows(src: string, delimiter = ','): string[][] {
++ const rows: string[][]=[];let row:string[]=[],cell='',quoted=false;
++ for(let i=0;i<src.length;i++){
++  const c=src[i];
++  if(c==='"'){if(quoted&&src[i+1]==='"'){cell+='"';i++;}else quoted=!quoted;}
++  else if(c===delimiter&&!quoted){row.push(cell);cell='';}
++  else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&src[i+1]==='\n')i++;row.push(cell);cell='';if(row.some(x=>x.trim()))rows.push(row);row=[];}
++  else cell+=c;
++ }
++ if(quoted)throw new Error('CSV has an unmatched quotation mark');
++ row.push(cell);if(row.some(x=>x.trim()))rows.push(row);
++ return rows;
++}
++function parseDelimited(src: string, delimiter: string): AnswerBankRow[] {
++ const all=csvRows(src,delimiter);if(!all.length)return [];
++ const headings=all.shift()!.map(s=>norm(s).replace(/[ _-]/g,''));
++ const aliases:Record<string,keyof AnswerBankRow>={id:'id',stableid:'stableId',question:'question',prompt:'prompt', 'câuhỏi':'question', 'cauhoi':'question',answer:'answer','đápán':'answer',dapan:'answer',text:'text',selected:'selected',choicetext:'choiceText',filepath:'filePath',localfilepath:'localFilePath',filename:'fileName',confidence:'confidence'};
++ if(!headings.some(h=>aliases[h]==='answer'||aliases[h]==='text'||aliases[h]==='selected'||aliases[h]==='filePath'))throw new Error('CSV/TSV answer file requires an answer/text/selected/filePath column');
++ return all.map(line=>{const r:Record<string,unknown>={};headings.forEach((h,i)=>{if(aliases[h]&&line[i]?.trim())r[aliases[h]]=line[i].trim();});return r as AnswerBankRow;});
++}
++function parseText(src: string): AnswerBankRow[] {
++ const rows:AnswerBankRow[]=[];
++ // Q: prompt / A: answer, with blank lines separating pairs.
++ let question='';
++ for(const raw of src.split(/\r?\n/)){
++  const line=raw.trim().replace(/^[-*]\s+/, '');
++  if(!line)continue;
++  const q=/^(?:Q|Question|Câu hỏi|Cau hoi)\s*:\s*(.+)$/i.exec(line);
++  const ans=/^(?:A|Answer|Đáp án|Dap an)\s*:\s*(.*)$/i.exec(line);
++  if(q){question=q[1];continue;}
++  if(ans&&question){rows.push({question,answer:ans[1]});question='';continue;}
++  const kv=/^(.+?)\s*(?:=>|\t|\s+\|\s+)\s*(.+)$/.exec(line);
++  if(kv)rows.push({question:kv[1],answer:kv[2]});
++ }
++ return rows;
++}
++function parseJson(src: string): AnswerBankRow[] {
++ const parsed:unknown=JSON.parse(src);
++ if(Array.isArray(parsed))return parsed as AnswerBankRow[];
++ if(!parsed||typeof parsed!=='object')throw new Error('JSON answer bank must be object or array');
++ const data=parsed as Record<string,unknown>;
++ if(Array.isArray(data.answers))return data.answers as AnswerBankRow[];
++ if(Array.isArray(data.rows))return data.rows as AnswerBankRow[];
++ return Object.entries(data).filter(([k])=>!['__proto__','prototype','constructor'].includes(k)).map(([question,v])=>typeof v==='string'?{question,answer:v}:{question,...(v&&typeof v==='object'&&!Array.isArray(v)?v:{answer:String(v)})}) as AnswerBankRow[];
++}
++export async function loadAnswerBanks(paths: string[]):Promise<AnswerBank> {
++ const bank:AnswerBank={rows:[],warnings:[],sources:[]};
++ for(const raw of paths){
++  if(typeof raw!=='string'||!raw.trim()||/^https?:\/\//i.test(raw))throw new Error('Answer bank must be a local file explicitly selected by the user');
++  const filepath=resolve(raw);
++  const st=await lstat(filepath);
++  if(!st.isFile()||st.isSymbolicLink()||st.size>MAX_BANK_BYTES)throw new Error(`Invalid, symlinked, or oversized answer bank: ${basename(filepath)}`);
++  const ext=extname(filepath).toLowerCase();
++  const src=(await readFile(filepath,'utf8')).replace(/^\uFEFF/,'');
++  let rows:AnswerBankRow[];
++  if(ext==='.json')rows=parseJson(src);
++  else if(ext==='.csv')rows=parseDelimited(src,',');
++  else if(ext==='.tsv')rows=parseDelimited(src,'\t');
++  else if(ext==='.md'||ext==='.txt')rows=parseText(src);
++  else throw new Error(`Unsupported answer-bank format ${ext}: use JSON, CSV, TSV, TXT, MD`);
++  if(bank.rows.length+rows.length>MAX_ROWS)throw new Error('Too many answer-bank rows');
++  for(const row of rows){
++   if(!row||typeof row!=='object'||Array.isArray(row))continue;
++   const r={...row};
++   const localPath=r.localFilePath||r.filePath;
++   if(typeof localPath==='string'&&localPath.trim()){
++    if(/^https?:\/\//i.test(localPath))throw new Error('Remote upload paths are forbidden');
++    r.localFilePath=isAbsolute(localPath)?resolve(localPath):resolve(dirname(filepath),localPath);
++   }
++   bank.rows.push(r);
++  }
++  bank.sources.push(filepath);
++ }
++ return bank;
++}
++function splitSelections(raw: string[]|string|undefined):string[] {
++ if(Array.isArray(raw))return raw.filter(x=>typeof x==='string').map(x=>x.trim()).filter(Boolean);
++ if(typeof raw==='string')return raw.split(/\s*\|\s*|\s*;\s*/).map(x=>x.trim()).filter(Boolean);
++ return [];
++}
++export function answerFromBank(q: Question, bank: AnswerBank): Answer|undefined {
++ if(q.kind==='unsupported'||q.humanOnly)return undefined;
++ const matching=bank.rows.filter(r=>{
++  if(r.stableId)return !!q.stableId&&norm(r.stableId)===norm(q.stableId);
++  if(r.id)return norm(r.id)===norm(q.id);
++  return !!(r.question||r.prompt)&&norm(r.question||r.prompt||'')===norm(q.prompt);
++ });
++ // Conflicts are not guessed, even if two rows use the same question prompt.
++ if(matching.length!==1)return undefined;
++ const row=matching[0];
++ const a:Answer={id:q.id}; // User-supplied is not a model confidence score or a guarantee of correctness.
++ if(q.kind==='radio'||q.kind==='checkbox'||q.kind==='select'){
++  const candidates=splitSelections(row.selected||row.choiceText||row.answer||row.text);
++  if(!candidates.length)return undefined;
++  const ids:string[]=[];
++  const allowOptionIds=row.selected!==undefined;
++  for(const token of candidates){
++   const matches=q.options.filter(o=>norm(o.text)===norm(token)||(allowOptionIds&&o.id===token));
++   if(matches.length!==1)return undefined;
++   if(!ids.includes(matches[0].id))ids.push(matches[0].id);
++  }
++  if(q.kind!=='checkbox'&&ids.length!==1)return undefined;
++  a.selected=ids;
++ }else if(q.kind==='file'){
++  const local=row.localFilePath||row.filePath;
++  if(typeof local==='string'&&local.trim())a.localFilePath=local;
++  else if(typeof row.text==='string'&&row.text.trim()){a.fileContent=row.text;a.fileName=row.fileName||'answer.txt';}
++  else return undefined;
++ }else{
++  const val=row.text??row.answer;
++  if(typeof val!=='string'||!val.trim())return undefined;
++  a.text=val;
++ }
++ return a;
++}
++export function splitBankAndAi(questions:Question[], bank:AnswerBank):{bankAnswers:Answer[];unmatched:Question[]} {
++ const bankAnswers:Answer[]=[],unmatched:Question[]=[];
++ const prompts=new Map<string,number>();
++ for(const q of questions)prompts.set(norm(q.prompt),(prompts.get(norm(q.prompt))||0)+1);
++ for(const q of questions){
++  // Repeated generic prompts may be separate distinct questions; do not reuse one prompt-only row for all.
++  const ambiguous=(prompts.get(norm(q.prompt))||0)>1 && !bank.rows.some(r=>
++   (r.stableId&&q.stableId&&norm(r.stableId)===norm(q.stableId))||(r.id&&norm(r.id)===norm(q.id)));
++  const a=ambiguous?undefined:answerFromBank(q,bank);
++  if(a)bankAnswers.push(a);else unmatched.push(q);
++ }
++ return {bankAnswers,unmatched};
++}
+--- /dev/null
++++ b/tests/answer-bank.test.ts
+@@ -0,0 +1,44 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtempSync,writeFileSync,rmSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { loadAnswerBanks, answerFromBank, splitBankAndAi } from '../src/answer-bank.js';
++import type { Question } from '../src/types.js';
++const q=(id:string,kind:Question['kind'],prompt:string):Question=>({id,kind,prompt,options:kind==='radio'||kind==='select'||kind==='checkbox'?[{id:'0',text:'Paris'},{id:'1',text:'Lyon'}]:[],required:true,hasVisual:false,stableId:'question-777-1'});
++async function sandbox(fn:(d:string)=>Promise<void>){const d=mkdtempSync(join(tmpdir(),'atqa-answer-bank-'));try{await fn(d)}finally{rmSync(d,{recursive:true,force:true})}}
++test('bank JSON selects by exact stable ID, maps text after option shuffle, AI receives only missing questions',async()=>sandbox(async d=>{
++ const file=join(d,'answers.json');writeFileSync(file,JSON.stringify({answers:[{stableId:'question-777-1',answer:'Paris'}]}));
++ const bank=await loadAnswerBanks([file]);
++ const {bankAnswers,unmatched}=splitBankAndAi([q('m1','radio','Capital?'),{...q('m2','text','Other?'),stableId:'question-777-2'}],bank);
++ assert.deepEqual(bankAnswers.map(a=>a.selected),[['0']]);assert.equal(unmatched.length,1);
++}));
++test('CSV quotes, TXT Q/A, and exact prompt matching',async()=>sandbox(async d=>{
++ const csv=join(d,'answer.csv'),txt=join(d,'answers.txt');
++ writeFileSync(csv,'question,answer\n"Which capital, France?",Paris\n');
++ writeFileSync(txt,'Q: Derivative of x²?\nA: 2x\n');
++ const bank=await loadAnswerBanks([csv,txt]);
++ assert.deepEqual(answerFromBank({...q('m2','radio','Which capital, France?'),stableId:'unmatched'},bank)?.selected,['0']);
++ assert.equal(answerFromBank({...q('m3','text','Derivative of x²?'),stableId:'other'},bank)?.text,'2x');
++}));
++test('ambiguous answer keys are never guessed',async()=>sandbox(async d=>{
++ const file=join(d,'dup.json');writeFileSync(file,JSON.stringify([{question:'Same?',answer:'Paris'},{question:'Same?',answer:'Lyon'}]));
++ const bank=await loadAnswerBanks([file]);
++ assert.equal(answerFromBank({...q('m4','radio','Same?'),stableId:'not-matched'},bank),undefined);
++}));
++test('local file references are resolved relative to the answer file, no upload is fabricated',async()=>sandbox(async d=>{
++ const file=join(d,'upload.json');writeFileSync(file,JSON.stringify([{id:'upload1',filePath:'my-handout.pdf'}]));
++ const bank=await loadAnswerBanks([file]);
++ assert.equal(answerFromBank({...q('upload1','file','Upload a file'),stableId:'x'},bank)?.localFilePath,join(d,'my-handout.pdf'));
++}));
++test('malformed answer files fail visibly instead of silently calling AI for every question',async()=>sandbox(async d=>{
++ const file=join(d,'bad.csv');writeFileSync(file,'foo,bar\nX,Y\n');
++ await assert.rejects(loadAnswerBanks([file]),/requires an answer/);
++}));
++
++test('repeated generic question prompts cannot share one bank answer',async()=>sandbox(async d=>{
++ const file=join(d,'answers.txt');writeFileSync(file,'Q: Select the right answer\nA: Paris\n');
++ const bank=await loadAnswerBanks([file]);
++ const qs=[{...q('q1','radio','Select the right answer'),stableId:'id-1'},{...q('q2','radio','Select the right answer'),stableId:'id-2'}];
++ const r=splitBankAndAi(qs,bank);assert.equal(r.bankAnswers.length,0);assert.equal(r.unmatched.length,2);
++}));
