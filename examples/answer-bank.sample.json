@@ -1,0 +1,8 @@
+{
+  "answers": [
+    {"stableId":"question-7001-1","answer":"Paris"},
+    {"question":"Which transport protocol is connection-oriented?","answer":"TCP"},
+    {"id":"q3","text":"My independently prepared response."},
+    {"id":"q4","filePath":"./attachments/my-response.pdf"}
+  ]
+}

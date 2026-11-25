@@ -1,0 +1,262 @@
+/** Main Command Deck: Tokyo Night / Cyberpunk Workstation Console.
+ * Arrow-key navigable, non-flicker re-rendering, complete 13 modules and real-time status HUD.
+ */
+import { createInterface } from 'node:readline/promises';
+import { stdin, stdout } from 'node:process';
+import { spawnSync } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import {
+  header,
+  section,
+  info,
+  warn,
+  success,
+  fail,
+  close,
+  renderBreadcrumb,
+  renderPanelBox,
+  renderMeterBar,
+  paint,
+  badge,
+  introAnimation,
+  setupTerminalCleanup,
+  toast
+} from './ui/tokyo.js';
+import { loadTheme, theme } from './ui/themes.js';
+import { selectMenu, type MenuItem } from './ui/menu.js';
+import { dashboardAlerts, showReports, recentReports } from './ui/dashboard.js';
+import { checkFirstRunStatus, browserSetupInteractive } from './setup.js';
+import { runModelCenter } from './ui/model-center-cli.js';
+import { readProfilesDb } from './model-center/routing.js';
+import { countTotalProfileKeySlots } from './model-center/key-manager.js';
+import { getKeySlotTelemetrySnapshot } from './model-center/model-router.js';
+import { runAppearanceStudio } from './ui/appearance-cli.js';
+import { runTaskQueueCli } from './ui/task-queue-cli.js';
+import { runDeadlineRadarCli } from './ui/deadline-radar-cli.js';
+import { runAccountsConsole } from './ui/accounts-cli.js';
+import { listAccounts } from './accounts.js';
+import { listAllCheckpoints } from './task-manager.js';
+import { bootstrapIntermediateCa } from './ca-bootstrap.js';
+import { npmRunInvocation } from './npm-runner.js';
+import { runAgentCli } from './agent/cli.js';
+
+type RecordAny = Record<string, any>;
+const python = process.env.AUTOTASK_PYTHON || 'python';
+
+const menu: MenuItem[] = [
+  { id: '1', label: 'Browser Agent', description: 'Web tasks, Moodle, Forms, an toàn có xác nhận nộp' },
+  { id: '2', label: 'Desktop Computer Use', description: 'Quan sát và điều khiển cửa sổ Windows UI Automation' },
+  { id: '3', label: 'LMS & Course Discovery', description: 'Quét tự động khóa học, môn học, bài tập & deadline' },
+  { id: '4', label: 'Task Queue', description: 'Quản lý tác vụ, tiến độ, checkpoint, tạm dừng & thử lại' },
+  { id: '5', label: 'Model Center', description: 'Quản lý AI: My Models, Catalog, Key Manager & Routing' },
+  { id: '6', label: 'Account Vault', description: 'Quản lý tài khoản LMS, mật khẩu Windows Keyring & Sessions' },
+  { id: '7', label: 'AI Notes', description: 'Ghi chú chỉ dẫn riêng cho AI (Global, Host & Task scoped)' },
+  { id: '8', label: 'Deadline Radar', description: 'Ra-đa theo dõi hạn chót bài tập theo thời gian thực' },
+  { id: '9', label: 'Task History & Reports', description: 'Lịch sử thực thi, điểm số đã quan sát & báo cáo chi tiết' },
+  { id: '10', label: 'Appearance Studio', description: 'Đổi Theme (Tokyo Night/Cyberpunk), font, opacity & cursor' },
+  { id: '11', label: 'Setup Wizard', description: 'Tạo & chỉnh sửa cấu hình multi-site, multi-account' },
+  { id: '12', label: 'System Doctor', description: 'Chẩn đoán môi trường, dependencies, Keyring & Playwright' },
+  { id: '13', label: 'Autonomous Agent', description: 'Điều khiển bằng prompt tự nhiên (Codex/Claude-style terminal agent)' },
+  { id: '0', label: 'Exit', description: 'Đóng Command Deck an toàn' }
+];
+
+async function collectWorkspaceState() {
+  let defaultModel = 'Chưa cấu hình';
+  let defaultProvider = 'N/A';
+  let modelProfilesCount = 0;
+  let totalKeySlots = 0;
+
+  try {
+    const db = await readProfilesDb();
+    const profiles = db.profiles || {};
+    modelProfilesCount = Object.keys(profiles).length;
+    totalKeySlots = countTotalProfileKeySlots(db);
+    if (db.default && profiles[db.default]) {
+      defaultModel = db.default;
+      defaultProvider = profiles[db.default].provider || 'custom';
+    }
+  } catch {}
+
+  const accounts = await listAccounts();
+  const accountsCount = Object.keys(accounts).length;
+
+  const browserConfigExists = existsSync('.private/browser-task.json');
+  const browserAgentStatus = browserConfigExists ? 'SẴN SÀNG (READY)' : 'CHƯA CẤU HÌNH (CẦN SETUP)';
+
+  let queuedTasks = 0;
+  let runningTasks = 0;
+
+  try {
+    const q = JSON.parse(await readFile('.private/desktop-queue.json', 'utf8')) as RecordAny;
+    const jobs = q.jobs || [];
+    queuedTasks += jobs.filter((x: RecordAny) => x.status === 'PENDING').length;
+    runningTasks += jobs.filter((x: RecordAny) => x.status === 'RUNNING').length;
+  } catch {}
+
+  const checkpoints = await listAllCheckpoints();
+  queuedTasks += checkpoints.filter(c => c.status === 'PENDING').length;
+  runningTasks += checkpoints.filter(c => c.status === 'RUNNING').length;
+
+  const reports = await recentReports(10);
+  const reportsCount = reports.length;
+
+  const alerts = await dashboardAlerts();
+
+  return {
+    defaultModel,
+    defaultProvider,
+    modelProfilesCount,
+    totalKeySlots,
+    accountsCount,
+    browserAgentStatus,
+    browserConfigExists,
+    queuedTasks,
+    runningTasks,
+    reportsCount,
+    alerts
+  };
+}
+
+function execute(args: string[], label: string): void {
+  info('Mở ' + label + '…');
+  // Phase 9C: no shell. Only "npm run <allowlisted script>" is accepted; it is executed as "node npm-cli.js run <script>".
+  let inv;
+  try {
+    if (args.length !== 3 || args[0] !== 'npm' || args[1] !== 'run') throw new Error('launcher only runs: npm run <script>');
+    inv = npmRunInvocation(args[2]);
+  } catch (e) { fail(e instanceof Error ? e.message : String(e)); return; }
+  const res = spawnSync(inv.command, inv.args, { stdio: 'inherit' });
+  if (res.error) fail(res.error.message);
+  else if (res.status !== 0) warn(`${label}: mã thoát ${res.status ?? 'unknown'}`);
+  else success(`${label} đã hoàn tất`);
+}
+
+async function pause(): Promise<void> {
+  if (!stdin.isTTY) return;
+  const r = createInterface({ input: stdin, output: stdout });
+  try {
+    await r.question('\n  Nhấn Enter để quay về Command Deck… ');
+  } finally {
+    r.close();
+  }
+}
+
+export async function launch(): Promise<void> {
+  bootstrapIntermediateCa();
+  setupTerminalCleanup();
+  await loadTheme();
+
+  // Unified single-workflow default: go straight to Autonomous Agent (Select Profile / Credentials -> Enter Prompt -> A-Z Execution)
+  // Pass --deck or --menu to open the legacy 13-module Command Deck
+  const args = process.argv.slice(2);
+  if (!args.includes('--deck') && !args.includes('--menu')) {
+    await runAgentCli();
+    return;
+  }
+
+  await introAnimation();
+
+  // First-run setup check
+  const firstRun = await checkFirstRunStatus();
+  if (!firstRun.browserTaskConfigured) {
+    header('FIRST-RUN SETUP ASSISTANT');
+    renderBreadcrumb(['COMMAND DECK', 'FIRST-RUN ONBOARDING']);
+    info('Chào mừng bạn đến với AutoTask AI Terminal Workstation!');
+    firstRun.details.forEach(d => warn(`  • ${d}`));
+    info('Bạn có thể cấu hình nhanh Browser Agent ngay bây giờ hoặc tiếp tục vào Command Deck.');
+
+    if (stdin.isTTY) {
+      const cli = createInterface({ input: stdin, output: stdout });
+      try {
+        const answer = (await cli.question('  ❯ Bạn có muốn khởi chạy Setup Wizard ngay bây giờ không? (Y/n)  ›  ')).trim();
+        if (answer.toLowerCase() !== 'n') {
+          cli.close();
+          await browserSetupInteractive();
+        }
+      } finally {
+        try { cli.close(); } catch {}
+      }
+    }
+  }
+
+  while (true) {
+    header('COMMAND DECK  /  AI WORKSTATION');
+    renderBreadcrumb(['AUTOTASK AI', 'COMMAND DECK']);
+
+    const s = await collectWorkspaceState();
+    const telSlots = getKeySlotTelemetrySnapshot();
+    const reqToday = telSlots.reduce((sum, x) => sum + (x.usedRpdToday || 0), 0);
+    const capToday = telSlots.reduce((sum, x) => sum + (x.limits?.rpd || 0), 0);
+
+    section('BẢNG ĐIỀU KHIỂN HỆ THỐNG (LIVE WORKSPACE HUD)');
+    renderPanelBox(
+      'WORKSTATION STATUS & KEY-POOL TELEMETRY',
+      [
+        `Theme & FX       : ${paint(theme().theme.toUpperCase(), theme().theme === 'cyberpunk' ? 'purple' : 'cyan', true)} · ${theme().animations !== false ? badge('FX ON', 'green') : badge('FX OFF', 'muted')}`,
+        `Model & Key Pool : ${paint(`${s.defaultModel} [${s.defaultProvider.toUpperCase()}]`, 'aqua', true)} · ${s.modelProfilesCount} profile / ${s.totalKeySlots} API key slot`,
+        `Tải API hôm nay  : ${renderMeterBar(reqToday, Math.max(20, capToday), 14)} (${reqToday} requests hôm nay)`,
+        `Tài khoản & Web  : ${s.accountsCount} tài khoản OS Keyring · Browser ${s.browserAgentStatus}`,
+        `Tác vụ & Radar   : ${s.runningTasks} chạy / ${s.queuedTasks} chờ · Deadline: ${s.alerts.urgent} ≤24h / ${s.alerts.overdue} quá hạn`
+      ],
+      theme().theme === 'cyberpunk' ? 'cyan' : 'purple',
+      `${s.totalKeySlots} KEYS`
+    );
+
+    if (!s.browserConfigExists) {
+      warn('Chưa có cấu hình tác vụ trình duyệt (.private/browser-task.json). Hãy chọn [11] Setup Wizard.');
+    }
+
+    const action = await selectMenu('MENU CHÍNH (ĐIỀU HƯỚNG BẰNG PHÍM MŨI TÊN HOẶC SỐ)', menu);
+    if (action === '0' || action.toLowerCase() === 'exit') {
+      close('PHIÊN LÀM VIỆC ĐÃ ĐÓNG AN TOÀN');
+      break;
+    }
+
+    if (action === '1') {
+      if (!s.browserConfigExists) {
+        warn('Chưa có cấu hình .private/browser-task.json. Mở Setup Wizard...');
+        await browserSetupInteractive();
+      } else {
+        execute(['npm', 'run', 'browser'], 'Browser Agent');
+      }
+    } else if (action === '2') {
+      execute(['npm', 'run', 'desktop'], 'Desktop Computer Use');
+    } else if (action === '3') {
+      execute(['npm', 'run', 'discover'], 'LMS & Course Discovery');
+    } else if (action === '4') {
+      await runTaskQueueCli();
+    } else if (action === '5') {
+      await runModelCenter();
+    } else if (action === '6') {
+      await runAccountsConsole();
+    } else if (action === '7') {
+      execute(['npm', 'run', 'notes'], 'AI Notes');
+    } else if (action === '8') {
+      await runDeadlineRadarCli();
+    } else if (action === '9') {
+      await showReports();
+    } else if (action === '10') {
+      await runAppearanceStudio();
+      await loadTheme();
+    } else if (action === '11') {
+      const { main: runSetup } = await import('./setup.js');
+      await runSetup();
+    } else if (action === '12') {
+      execute(['npm', 'run', 'doctor'], 'System Doctor');
+    } else if (action === '13' || action.toLowerCase() === 'a') {
+      execute(['npm', 'run', 'agent'], 'Autonomous Agent');
+    } else {
+      warn('Lựa chọn không hợp lệ.');
+    }
+
+    await pause();
+  }
+}
+
+if (process.argv[1] && /(?:^|[\\/])launcher\.(?:ts|js)$/.test(process.argv[1])) {
+  launch().catch(e => {
+    fail(String(e));
+    process.exitCode = 1;
+  });
+}
